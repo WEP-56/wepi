@@ -1,0 +1,53 @@
+
+
+# Dependencies
+node_modules/
+
+# Build outputs
+out/
+dist/
+release/
+docs-site/.vitepress/cache/
+docs-site/.vitepress/dist/
+*.asar
+
+# Electron/Vite
+.vite/
+.cache/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Local artifacts
+*.local
+downloads/
+.pi-lens
+.playwright-mcp/
+
+# 不便展示内容
+docs/开发私密
+.agents
+example/
+pi/

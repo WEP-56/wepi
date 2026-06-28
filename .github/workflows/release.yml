@@ -1,0 +1,184 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example 0.0.1 or v0.0.1"
+        required: true
+        default: "0.0.1"
+      draft:
+        description: "Create the GitHub Release as a draft"
+        type: boolean
+        required: false
+        default: false
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 24.13.0
+
+jobs:
+  prepare-release:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      release_body: ${{ steps.notes.outputs.body }}
+      draft: ${{ steps.meta.outputs.draft }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRAFT: ${{ inputs.draft }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            DRAFT=false
+            PRERELEASE=false
+          else
+            VERSION="${INPUT_VERSION#v}"
+            TAG="v${VERSION}"
+            DRAFT="${INPUT_DRAFT:-false}"
+            PRERELEASE="${INPUT_PRERELEASE:-false}"
+          fi
+
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: ${VERSION}" >&2
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_name=WEpi ${TAG}" >> "$GITHUB_OUTPUT"
+          echo "draft=${DRAFT}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes
+        id: notes
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          BODY=""
+          if [ -f CHANGELOG.zh-CN.md ]; then
+            BODY="$(awk -v ver="${TAG}" '/^## v[0-9]/{if(found) exit; if($2==ver) found=1; next} found{print}' CHANGELOG.zh-CN.md)"
+          fi
+          if [ -z "${BODY}" ] && [ -f CHANGELOG.md ]; then
+            BODY="$(awk -v ver="${TAG}" '/^## v[0-9]/{if(found) exit; if($2==ver) found=1; next} found{print}' CHANGELOG.md)"
+          fi
+          if [ -z "${BODY}" ]; then
+            BODY="WEpi ${TAG}"
+          fi
+
+          {
+            echo "body<<EOF"
+            echo "${BODY}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build-release:
+    name: Build ${{ matrix.name }}
+    needs: prepare-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            command: npm run build && npx electron-builder --win nsis portable zip --x64 --publish never
+            electron_mirror: https://npmmirror.com/mirrors/electron/
+            electron_builder_binaries_mirror: https://npmmirror.com/mirrors/electron-builder-binaries/
+          - name: Windows arm64
+            os: windows-latest
+            command: npm run build && npx electron-builder --win nsis portable zip --arm64 --publish never
+            electron_mirror: https://npmmirror.com/mirrors/electron/
+            electron_builder_binaries_mirror: https://npmmirror.com/mirrors/electron-builder-binaries/
+          - name: macOS x64
+            os: macos-latest
+            command: npm run build && npx electron-builder --mac dmg zip --x64 --publish never
+            electron_mirror: ""
+            electron_builder_binaries_mirror: ""
+          - name: macOS arm64
+            os: macos-latest
+            command: npm run build && npx electron-builder --mac dmg zip --arm64 --publish never
+            electron_mirror: ""
+            electron_builder_binaries_mirror: ""
+          - name: Linux x64
+            os: ubuntu-latest
+            command: npm run build && npx electron-builder --linux AppImage deb tar.gz --x64 --publish never
+            electron_mirror: https://npmmirror.com/mirrors/electron/
+            electron_builder_binaries_mirror: https://npmmirror.com/mirrors/electron-builder-binaries/
+          - name: Linux arm64
+            os: ubuntu-latest
+            command: npm run build && npx electron-builder --linux AppImage deb tar.gz --arm64 --publish never
+            electron_mirror: https://npmmirror.com/mirrors/electron/
+            electron_builder_binaries_mirror: https://npmmirror.com/mirrors/electron-builder-binaries/
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate app icon
+        run: npm run make-icon
+
+      - name: Build packages
+        run: ${{ matrix.command }}
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ELECTRON_MIRROR: ${{ matrix.electron_mirror }}
+          ELECTRON_BUILDER_BINARIES_MIRROR: ${{ matrix.electron_builder_binaries_mirror }}
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          name: ${{ needs.prepare-release.outputs.release_name }}
+          body: ${{ needs.prepare-release.outputs.release_body }}
+          draft: ${{ needs.prepare-release.outputs.draft }}
+          prerelease: ${{ needs.prepare-release.outputs.prerelease }}
+          fail_on_unmatched_files: false
+          files: |
+            release/*.exe
+            release/*.msi
+            release/*.zip
+            release/*.dmg
+            release/*.AppImage
+            release/*.deb
+            release/*.tar.gz
+            release/*.blockmap

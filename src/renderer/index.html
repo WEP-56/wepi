@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WEpi</title>
+    <style>
+      /* Keep first paint self-contained so packaged startup never flashes white. */
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { height: 100%; overflow: hidden; background: #111315; color: #f4f1e8; }
+      .root-loading {
+        width: 100vw;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 22px;
+        background:
+          radial-gradient(circle at 50% 46%, rgba(35, 134, 54, 0.12), transparent 32%),
+          #111315;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .boot-word {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 2px;
+        color: #f4f1e8;
+        font-size: 58px;
+        font-weight: 760;
+        line-height: 1;
+      }
+      .boot-word span {
+        display: inline-block;
+        opacity: 0;
+        transform: translateY(18px) scale(0.96);
+        animation: boot-letter-in 2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+      }
+      .boot-word span:nth-child(2) { animation-delay: 0.16s; }
+      .boot-word span:nth-child(3) { animation-delay: 0.32s; }
+      .boot-word span:nth-child(4) { animation-delay: 0.48s; color: #35c759; }
+      .boot-spinner {
+        width: 22px;
+        height: 22px;
+        border: 2px solid rgba(244, 241, 232, 0.18);
+        border-top-color: #35c759;
+        border-radius: 999px;
+        animation: boot-spin 0.8s linear infinite;
+      }
+      @keyframes boot-letter-in {
+        0% { opacity: 0; transform: translateY(18px) scale(0.96); filter: blur(6px); }
+        42% { opacity: 1; transform: translateY(0) scale(1.02); filter: blur(0); }
+        70%, 100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+      }
+      @keyframes boot-spin {
+        to { transform: rotate(360deg); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-word span { animation-duration: 0.01ms; }
+        .boot-spinner { animation-duration: 1.2s; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="boot-screen root-loading" aria-label="WEpi loading">
+        <div class="boot-word" aria-hidden="true">
+          <span>W</span><span>E</span><span>P</span><span>i</span>
+        </div>
+        <div class="boot-spinner" aria-hidden="true"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
