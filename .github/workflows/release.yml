@@ -101,6 +101,41 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Remove outdated Windows portable assets
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                core.info(`Release ${tag} does not exist yet; nothing to clean.`);
+                return;
+              }
+              throw error;
+            }
+
+            const staleAssets = release.data.assets.filter((asset) => {
+              return asset.name.includes("-win-") || asset.name === "latest-win.yml";
+            });
+
+            for (const asset of staleAssets) {
+              core.info(`Deleting stale Windows asset: ${asset.name}`);
+              await github.rest.repos.deleteReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                asset_id: asset.id
+              });
+            }
+
   build-release:
     name: Build ${{ matrix.name }}
     needs: prepare-release
@@ -111,12 +146,12 @@ jobs:
         include:
           - name: Windows x64
             os: windows-latest
-            command: npm run build && npx electron-builder --win nsis portable zip --x64 --publish never
+            command: npm run build && npx electron-builder --win nsis --x64 --publish never
             electron_mirror: https://npmmirror.com/mirrors/electron/
             electron_builder_binaries_mirror: https://npmmirror.com/mirrors/electron-builder-binaries/
           - name: Windows arm64
             os: windows-latest
-            command: npm run build && npx electron-builder --win nsis portable zip --arm64 --publish never
+            command: npm run build && npx electron-builder --win nsis --arm64 --publish never
             electron_mirror: https://npmmirror.com/mirrors/electron/
             electron_builder_binaries_mirror: https://npmmirror.com/mirrors/electron-builder-binaries/
           - name: macOS x64

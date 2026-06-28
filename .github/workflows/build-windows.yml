@@ -37,7 +37,7 @@ jobs:
         run: npm run make-icon
 
       - name: Build Windows ${{ matrix.arch }} package
-        run: npm run build && npx electron-builder --win nsis portable zip --${{ matrix.arch }} --publish never
+        run: npm run build && npx electron-builder --win nsis --${{ matrix.arch }} --publish never
         env:
           NODE_OPTIONS: "--max-old-space-size=4096"
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
@@ -50,6 +50,5 @@ jobs:
           if-no-files-found: error
           path: |
             release/*.exe
-            release/*.zip
             release/*.blockmap
             release/latest-win.yml

@@ -69,10 +69,9 @@
     },
     "win": {
       "icon": "build/icon.ico",
+      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}",
       "target": [
-        "nsis",
-        "portable",
-        "zip"
+        "nsis"
       ]
     },
     "nsis": {
