@@ -17,13 +17,14 @@
       "height": 820,
       "minWidth": 800,
       "minHeight": 560,
-      "decorations": false
+      "decorations": false,
+      "visible": true
     }],
     "security": { "csp": null }
   },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico", "icons/icon.png"]
   }
 }

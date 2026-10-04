@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import iconUrl from '../assets-icon.png';
 import { cn } from '../utils/cn';
 
+/** 应用图标：构建期由 Vite 内联（singlefile 模式下转 base64）。 */
+export function AppIcon({ size = 52, className }: { size?: number; className?: string }) {
+  return <img src={iconUrl} width={size} height={size} alt="WEPI" className={cn('shrink-0 select-none', className)} draggable={false} />;
+}
+
+/** 旧版矢量占位 Logo（保留兼容，逐步由 AppIcon 取代）。 */
 export function Logo({ size = 52, className }: { size?: number; className?: string }) {
   // scalloped cloud with terminal prompt
   const n = 9;
@@ -147,12 +154,13 @@ export function Kbd({ children }: { children: ReactNode }) {
   );
 }
 
-export function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
+export function Toggle({ on, onChange, disabled }: { on: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
   return (
     <button
-      onClick={() => onChange(!on)}
+      onClick={() => !disabled && onChange(!on)}
+      disabled={disabled}
       className={cn(
-        'relative h-[22px] w-[36px] shrink-0 rounded-full transition-colors',
+        'relative h-[22px] w-[36px] shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40',
         on ? 'bg-[var(--blue)]' : 'bg-[var(--border-strong)]',
       )}
     >

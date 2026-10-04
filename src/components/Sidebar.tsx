@@ -14,13 +14,14 @@ import {
   FolderPlus,
   ChevronDown,
   ChevronRight,
+  Loader2,
   MoreHorizontal,
   Pin,
   X,
 } from 'lucide-react';
 import type { Project, Thread } from '../data';
 import { cn } from '../utils/cn';
-import { Logo } from './ui';
+import { AppIcon } from './ui';
 import { RenameInput } from './kit';
 import { ResizeHandle } from './Resizer';
 
@@ -52,7 +53,7 @@ export function Rail({
         </button>
       ))}
       <div className="my-1 h-px w-6 bg-[var(--border-strong)]" />
-      <button title="Pi 管理与插件" onClick={() => onNavigate('management')} className={btn(view === 'management')}>
+      <button title="Pi 高级管理" onClick={() => onNavigate('management')} className={btn(view === 'management')}>
         <Boxes size={17} />
       </button>
       <div className="flex-1" />
@@ -107,7 +108,7 @@ function ThreadRow({
     >
       <span className="min-w-0 flex-1 truncate">{t.title}</span>
       {busy ? (
-        <span className="ml-1 h-2 w-2 shrink-0 animate-pulse rounded-full bg-[var(--blue)]" />
+        <Loader2 size={12} className="ml-1 shrink-0 animate-spin text-[var(--blue)]" />
       ) : (
         t.unread && <span className="ml-1 h-2 w-2 shrink-0 rounded-full bg-[var(--blue)]" title="未读" />
       )}
@@ -206,7 +207,7 @@ export default function Sidebar({
 
       <div className="flex items-center px-4 pb-2 pt-4">
         <div className="flex select-none items-center gap-2 text-[var(--text)]">
-          <Logo size={22} />
+          <AppIcon size={22} />
           <span className="text-[17px] font-bold tracking-[0.14em]">WEPI</span>
         </div>
         <div className="flex-1" />

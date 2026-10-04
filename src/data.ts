@@ -34,16 +34,34 @@ export interface Step {
   pending?: boolean;
 }
 
+/** 回合内的一段活动：思考、工具调用或正文段落（保持到达时序）。 */
+export type TurnBlock =
+  | { kind: 'thinking'; id: string; text: string; running: boolean }
+  /** narration=true 表示过程叙述（"让我先看看…"），折进时间线而非正文 */
+  | { kind: 'text'; id: string; text: string; narration?: boolean }
+  | {
+      kind: 'tool';
+      id: string;
+      toolName: string;
+      args?: unknown;
+      result?: unknown;
+      running: boolean;
+      isError?: boolean;
+    };
+
 export interface Message {
   id: string;
   role: Role;
+  /** 旧字段：内容全文（历史消息迁移用；新消息以 blocks 为准渲染） */
   content: string;
+  blocks?: TurnBlock[];
   duration?: number;
   edits?: FileEdit[];
-  steps?: Step[];
+  /** @deprecated 旧流式标志；流式期间最后一个 text block 自带增长语义 */
   streaming?: boolean;
   thinking?: boolean;
   thinkingContent?: string;
+  steps?: Step[];
 }
 
 export interface Thread {

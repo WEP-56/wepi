@@ -9,6 +9,14 @@ use std::{
     time::Duration,
 };
 mod workspace;
+mod pi_mcp;
+mod pi_skills;
+mod pi_ext;
+mod pi_runtime;
+mod toml_lite;
+mod wepi_settings;
+mod shell_open;
+mod tray;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(windows)]
@@ -20,6 +28,21 @@ struct RpcSlot {
     child: Child,
     stdin: ChildStdin,
     ready: Arc<(Mutex<bool>, Condvar)>,
+    /// 握手通道：prepare 发出 get_state 后由读取线程回填响应。
+    /// 取代「看到任意一行 JSON 就算就绪」的旧判定——那行可能只是
+    /// Pi 的初始化通知，RPC 循环尚未开始消费 stdin。
+    handshake: Arc<(Mutex<Option<HandshakeState>>, Condvar)>,
+    /// 初始化期间捕获的 stderr（截断到 16KB），失败时并入错误信息。
+    stderr_tail: Arc<Mutex<String>>,
+}
+
+#[derive(Clone)]
+enum HandshakeState {
+    Pending,
+    /// get_state 响应（success 时 data 内含 sessionFile 等）。
+    Done(Value),
+    /// 进程退出 / 响应失败 / 解析失败。
+    Failed(String),
 }
 
 struct RpcProcess {
@@ -419,6 +442,8 @@ fn normalize_rpc_record(record: Value) -> Vec<Value> {
                 .get("delta")
                 .and_then(Value::as_str)
                 .map(|delta| serde_json::json!({"type":"assistant_text_delta","delta":delta})),
+            "text_start" => Some(serde_json::json!({"type":"assistant_text_start"})),
+            "text_end" => Some(serde_json::json!({"type":"assistant_text_end"})),
             "thinking_start" => Some(serde_json::json!({"type":"assistant_thinking_start"})),
             "thinking_delta" => event
                 .get("delta")
@@ -453,6 +478,7 @@ fn normalize_rpc_record(record: Value) -> Vec<Value> {
     if matches!(
         kind,
         "tool_execution_start" | "tool_execution_update" | "tool_execution_end"
+            | "turn_start" | "turn_end" | "agent_start" | "agent_end"
     ) {
         return vec![record];
     }
@@ -506,15 +532,47 @@ fn locate_node() -> Option<PathBuf> {
         candidates.push(PathBuf::from(path));
     }
     if let Ok(path) = std::env::var("ProgramFiles") {
-        candidates.push(PathBuf::from(path).join("nodejs/node.exe"));
+        candidates.push(PathBuf::from(path).join("nodejs").join("node.exe"));
     }
     if let Ok(path) = std::env::var("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(path).join("Programs/nodejs/node.exe"));
+        candidates.push(PathBuf::from(path).join("Programs").join("nodejs").join("node.exe"));
     }
     if let Ok(path) = std::env::var("APPDATA") {
-        candidates.push(PathBuf::from(path).join("npm/node.exe"));
+        candidates.push(PathBuf::from(path).join("npm").join("node.exe"));
+    }
+    // PATH 兜底：测试进程与自定义安装环境下候选目录可能都不命中。
+    if let Some(found) = which_on_path("node") {
+        candidates.push(found);
     }
     candidates.into_iter().find(|path| path.is_file())
+}
+
+/// 在 PATH 上查找可执行文件（含 Windows PATHEXT 扩展）。
+fn which_on_path(executable: &str) -> Option<PathBuf> {
+    let path_env = std::env::var("PATH").ok()?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in path_env.split(';').filter(|s| !s.is_empty()) {
+        let direct = Path::new(dir).join(executable);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        for ext in &extensions {
+            let with_ext = Path::new(dir).join(format!("{executable}{ext}"));
+            if with_ext.is_file() {
+                return Some(with_ext);
+            }
+        }
+    }
+    None
 }
 
 fn build_pi_command(executable: &str, session_path: Option<&str>) -> Result<Command, String> {
@@ -650,11 +708,17 @@ fn start_process_blocking(
 
     let ready: ReadyFlag = Arc::new((Mutex::new(false), Condvar::new()));
     let ready_out = ready.clone();
+    let handshake: Arc<(Mutex<Option<HandshakeState>>, Condvar)> =
+        Arc::new((Mutex::new(Some(HandshakeState::Pending)), Condvar::new()));
+    let handshake_out = handshake.clone();
+    let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let stderr_tail_out = stderr_tail.clone();
     let key_for_reader = session_key.clone();
     let (sender, receiver) = std::sync::mpsc::channel::<Result<Value, String>>();
 
     // 读取线程：解析 JSONL 并归一化，只负责投递。
     std::thread::spawn(move || {
+        let handshake_id = "wepi-prepare";
         for line in BufReader::new(stdout).lines() {
             match line {
                 Ok(line) if !line.trim().is_empty() => {
@@ -664,6 +728,28 @@ fn start_process_blocking(
                     ready_out.1.notify_all();
                     match serde_json::from_str::<Value>(&line) {
                         Ok(value) => {
+                            // 握手响应：匹配 id 且是 response 时回填握手通道，
+                            // 不再向前端转发（前端没有对应的等待者）。
+                            if value.get("type").and_then(Value::as_str) == Some("response")
+                                && value.get("id").and_then(Value::as_str) == Some(handshake_id)
+                            {
+                                let state = if value.get("success").and_then(Value::as_bool) == Some(true) {
+                                    HandshakeState::Done(value.get("data").cloned().unwrap_or(Value::Null))
+                                } else {
+                                    HandshakeState::Failed(
+                                        value
+                                            .get("error")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("Pi 会话初始化被拒绝")
+                                            .to_owned(),
+                                    )
+                                };
+                                if let Ok(mut slot) = handshake_out.0.lock() {
+                                    *slot = Some(state);
+                                }
+                                handshake_out.1.notify_all();
+                                continue;
+                            }
                             for event in normalized_events_with_key(value, &key_for_reader) {
                                 if sender.send(Ok(event)).is_err() {
                                     return;
@@ -683,6 +769,15 @@ fn start_process_blocking(
                 _ => break,
             }
         }
+        // stdout 关闭 = 进程退出：未完成的握手立即判失败，避免等待方干等超时。
+        if let Ok(mut slot) = handshake_out.0.lock() {
+            if matches!(slot.as_ref(), Some(HandshakeState::Pending) | None) {
+                *slot = Some(HandshakeState::Failed(
+                    "Pi RPC 进程在初始化完成前退出了".to_owned(),
+                ));
+            }
+        }
+        handshake_out.1.notify_all();
         // sender 随之 drop，刷新线程据此收尾。
     });
 
@@ -738,6 +833,16 @@ fn start_process_blocking(
                 }
             }
             if !diagnostics_text.is_empty() {
+                let joined = diagnostics_text.join("\n");
+                // 尾部截断到 16KB：只在初始化失败时作为上下文展示。
+                let tail: String = if joined.len() > 16 * 1024 {
+                    joined[joined.len() - 16 * 1024..].to_owned()
+                } else {
+                    joined
+                };
+                if let Ok(mut buffer) = stderr_tail_out.lock() {
+                    *buffer = tail;
+                }
                 let _ = diagnostics.emit("pi-rpc-error", diagnostics_text.join("\n"));
             }
         });
@@ -745,7 +850,16 @@ fn start_process_blocking(
     slots
         .lock()
         .map_err(|_| "RPC 状态锁定失败".to_owned())?
-        .insert(session_key, RpcSlot { child, stdin, ready });
+        .insert(
+            session_key,
+            RpcSlot {
+                child,
+                stdin,
+                ready,
+                handshake,
+                stderr_tail,
+            },
+        );
     Ok(())
 }
 
@@ -764,6 +878,93 @@ async fn pi_rpc_start(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// 握手式就绪：向 Pi 发送 `get_state` 并等待它的 response。
+/// 返回的 data 里带有 sessionFile / model 等，前端据此回填会话状态。
+/// 这是「首次对话必失败」的修复：就绪判定从「吐出任意一行」收紧为
+/// 「RPC 循环真正响应了一条命令」。
+///
+/// 顺序说明：先写命令再等响应（而不是先等第一行输出）。真实 Pi 启动时
+/// 会输出初始化通知，但协议上不能依赖它——读取线程对 wepi-prepare 的
+/// 响应拦截在缓冲之外，命令先到也不会丢失。
+fn prepare_blocking(
+    slots: &Slots,
+    session_key: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let (handshake, stderr_tail) = {
+        let guard = slots
+            .lock()
+            .map_err(|_| "RPC 状态锁定失败".to_owned())?;
+        let slot = guard
+            .get(session_key)
+            .ok_or("该会话的 Pi RPC 尚未启动")?;
+        (slot.handshake.clone(), slot.stderr_tail.clone())
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    // 仅当握手仍是 Pending 时发送 get_state；已完成的握手直接复用结果。
+    {
+        let (lock, cvar) = &*handshake;
+        let mut state = lock.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?;
+        if matches!(state.as_ref(), Some(HandshakeState::Pending)) {
+            write_record(
+                slots,
+                session_key,
+                &serde_json::json!({ "id": "wepi-prepare", "type": "get_state" }),
+            )?;
+            while matches!(state.as_ref(), Some(HandshakeState::Pending)) {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    *state = None;
+                    let stderr = stderr_tail
+                        .lock()
+                        .map(|buffer| buffer.trim().to_owned())
+                        .unwrap_or_default();
+                    return Err(if stderr.is_empty() {
+                        "Pi RPC 初始化超时（get_state 未响应）".to_owned()
+                    } else {
+                        format!("Pi RPC 初始化超时：{stderr}")
+                    });
+                }
+                let (guard, _) = cvar
+                    .wait_timeout(state, deadline - now)
+                    .map_err(|e| e.to_string())?;
+                state = guard;
+            }
+        }
+        match state.as_ref() {
+            Some(HandshakeState::Done(data)) => Ok(data.clone()),
+            Some(HandshakeState::Failed(message)) => {
+                let message = message.clone();
+                drop(state);
+                let stderr = stderr_tail
+                    .lock()
+                    .map(|buffer| buffer.trim().to_owned())
+                    .unwrap_or_default();
+                Err(if stderr.is_empty() {
+                    message
+                } else {
+                    format!("{message}\n{stderr}")
+                })
+            }
+            // 超时路径已把状态清空为 None；直接判定失败。
+            _ => Err("Pi RPC 初始化未完成".to_owned()),
+        }
+    }
+}
+
+#[tauri::command]
+async fn pi_rpc_prepare(
+    state: State<'_, RpcProcess>,
+    session_key: String,
+    timeout_ms: Option<u64>,
+) -> Result<Value, String> {
+    let slots = state.slots.clone();
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
+    tauri::async_runtime::spawn_blocking(move || prepare_blocking(&slots, &session_key, timeout))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -834,6 +1035,160 @@ async fn pi_rpc_stop_all(state: State<'_, RpcProcess>) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 用伪 Pi 脚本（Node）验证握手协议：先吐一行无关通知，再响应 get_state。
+    /// 旧实现只看「第一行 JSON」会在通知阶段就误判就绪；新实现必须等到
+    /// `{"id":"wepi-prepare","type":"response","success":true}` 才放行。
+    #[test]
+    fn prepare_waits_for_get_state_response_not_first_line() {
+        let script = r#"
+const lines = [];
+let fed = false;
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  fed = true;
+  // 忽略内容；收到任意命令后回握手响应。
+  const response = {id: 'wepi-prepare', type: 'response', command: 'get_state', success: true, data: {sessionFile: '/tmp/demo.jsonl', model: {id: 'm1', provider: 'p1'}}};
+  process.stdout.write(JSON.stringify(response) + '\n');
+});
+// 启动即输出一行「初始化通知」——旧逻辑会把它当成就绪信号。
+process.stdout.write(JSON.stringify({type: 'system', notice: 'booting'}) + '\n');
+setTimeout(() => { if (!fed) { process.stderr.write('no command received\n'); process.exit(1); } }, 5000);
+"#;
+        let dir = std::env::temp_dir().join(format!("wepi-prepare-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fake-pi.cjs");
+        fs::write(&script_path, script).unwrap();
+        let node = locate_node().expect("test requires node on PATH or standard install");
+
+        let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
+        let key = "prepare-test".to_owned();
+        let executable = node.to_string_lossy().into_owned();
+        let argument = script_path.to_string_lossy().into_owned();
+        // build_pi_command 只支持 pi 形态；这里直接手动构造 node 命令。
+        let mut command = Command::new(&executable);
+        command.arg(&argument).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn fake pi");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let ready: ReadyFlag = Arc::new((Mutex::new(false), Condvar::new()));
+        let handshake: Arc<(Mutex<Option<HandshakeState>>, Condvar)> =
+            Arc::new((Mutex::new(Some(HandshakeState::Pending)), Condvar::new()));
+        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let ready_out = ready.clone();
+        let handshake_out = handshake.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.trim().is_empty() { continue; }
+                *ready_out.0.lock().unwrap() = true;
+                ready_out.1.notify_all();
+                let value: Value = serde_json::from_str(&line).expect("fake pi emits valid json");
+                if value.get("id").and_then(Value::as_str) == Some("wepi-prepare") {
+                    *handshake_out.0.lock().unwrap() = Some(HandshakeState::Done(
+                        value.get("data").cloned().unwrap_or(Value::Null),
+                    ));
+                    handshake_out.1.notify_all();
+                }
+            }
+            let mut slot = handshake_out.0.lock().unwrap();
+            if matches!(slot.as_ref(), Some(HandshakeState::Pending) | None) {
+                *slot = Some(HandshakeState::Failed("exited early".into()));
+            }
+            handshake_out.1.notify_all();
+        });
+        slots.lock().unwrap().insert(
+            key.clone(),
+            RpcSlot { child, stdin, ready, handshake, stderr_tail },
+        );
+        let data = prepare_blocking(&slots, &key, Duration::from_secs(10)).expect("handshake completes");
+        assert_eq!(data["sessionFile"], json!("/tmp/demo.jsonl"));
+        // 二次 prepare：握手已完成，直接复用结果不再发命令。
+        let again = prepare_blocking(&slots, &key, Duration::from_secs(10)).expect("cached handshake");
+        assert_eq!(again["sessionFile"], json!("/tmp/demo.jsonl"));
+        let _ = take_slot(&slots, &key);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 握手失败路径：伪 Pi 对 get_state 回 success:false，prepare 必须报错而不是超时。
+    #[test]
+    fn prepare_surfaces_rejected_handshake() {
+        let script = r#"
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', () => {
+  process.stdout.write(JSON.stringify({id: 'wepi-prepare', type: 'response', success: false, error: 'no provider configured'}) + '\n');
+  setTimeout(() => process.exit(0), 100);
+});
+"#;
+        let dir = std::env::temp_dir().join(format!("wepi-prepare-fail-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fake-pi-fail.cjs");
+        fs::write(&script_path, script).unwrap();
+        let node = locate_node().expect("test requires node");
+
+        let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
+        let key = "prepare-fail".to_owned();
+        let mut command = Command::new(node);
+        command.arg(&script_path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let ready: ReadyFlag = Arc::new((Mutex::new(false), Condvar::new()));
+        let handshake: Arc<(Mutex<Option<HandshakeState>>, Condvar)> =
+            Arc::new((Mutex::new(Some(HandshakeState::Pending)), Condvar::new()));
+        let ready_out = ready.clone();
+        let handshake_out = handshake.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.trim().is_empty() { continue; }
+                *ready_out.0.lock().unwrap() = true;
+                ready_out.1.notify_all();
+                let value: Value = serde_json::from_str(&line).expect("valid json");
+                if value.get("id").and_then(Value::as_str) == Some("wepi-prepare") {
+                    *handshake_out.0.lock().unwrap() = Some(HandshakeState::Failed(
+                        value.get("error").and_then(Value::as_str).unwrap_or("unknown").to_owned(),
+                    ));
+                    handshake_out.1.notify_all();
+                }
+            }
+        });
+        slots.lock().unwrap().insert(
+            key.clone(),
+            RpcSlot { child, stdin, ready, handshake, stderr_tail: Arc::new(Mutex::new(String::new())) },
+        );
+        let error = prepare_blocking(&slots, &key, Duration::from_secs(10)).expect_err("must fail");
+        assert!(error.contains("no provider configured"), "error was: {error}");
+        let _ = take_slot(&slots, &key);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 归一化层：text_start/text_end 与 turn 边界必须透传给前端
+    /// （reducer 依赖它们做叙述降级与流式去重）。
+    #[test]
+    fn normalizer_passes_turn_and_text_boundaries() {
+        let cases = vec![
+            (
+                json!({"type":"message_update","assistantMessageEvent":{"type":"text_start"}}),
+                json!({"type":"assistant_text_start"}),
+            ),
+            (
+                json!({"type":"message_update","assistantMessageEvent":{"type":"text_end"}}),
+                json!({"type":"assistant_text_end"}),
+            ),
+            (
+                json!({"type":"turn_start"}),
+                json!({"type":"turn_start"}),
+            ),
+            (
+                json!({"type":"turn_end"}),
+                json!({"type":"turn_end"}),
+            ),
+        ];
+        for (input, expected) in cases {
+            let out = normalize_rpc_record(input);
+            assert_eq!(out.len(), 1, "expected single event for {expected}");
+            assert_eq!(out[0], expected);
+        }
+    }
 
     #[test]
     fn coalesces_adjacent_text_and_thinking_deltas() {
@@ -911,12 +1266,17 @@ mod tests {
         }));
         assert_eq!(events[0]["type"], json!("assistant_text_delta"));
 
-        // 未知增量类型（text_start/text_end）原样透传，由前端忽略
+        // text_start/end -> 边界事件（reducer 依赖做叙述降级与流式去重）
         let events = normalize_rpc_record(json!({
             "type": "message_update",
             "assistantMessageEvent": {"type": "text_start"}
         }));
-        assert_eq!(events[0]["type"], json!("message_update"));
+        assert_eq!(events[0]["type"], json!("assistant_text_start"));
+        let events = normalize_rpc_record(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_end"}
+        }));
+        assert_eq!(events[0]["type"], json!("assistant_text_end"));
     }
 
     #[test]
@@ -984,21 +1344,316 @@ mod tests {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Pi 管理：MCP / 技能 / 扩展 / 运行时                                  */
+/* ------------------------------------------------------------------ */
+
+#[tauri::command]
+async fn pi_mcp_snapshot() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(pi_mcp::load_snapshot)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_mcp_save(content: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || pi_mcp::save_writable(content))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_mcp_import_scan() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(pi_mcp::scan_import)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_mcp_import_apply(entries: Vec<(String, Value)>, overwrite: bool) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_mcp::apply_import(entries, overwrite))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_mcp_probe(definition: Value) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(pi_mcp::probe_server(&definition)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_list() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(pi_skills::list)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_read(path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_skills::read_content(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_create(location_id: String, name: String, description: String, content: Option<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        pi_skills::create(&location_id, &name, &description, content.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_write(path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || pi_skills::write_content(&path, &content))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_set_user_only(path: String, user_only: bool) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_skills::set_user_only(&path, user_only))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_rename(path: String, new_name: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_skills::rename(&path, &new_name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_delete(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || pi_skills::delete(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_store_search(query: String, limit: Option<u32>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_skills::store_search(&query, limit.unwrap_or(50)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_skills_store_install(slug: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_skills::store_install(&slug))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_extensions_list(force_refresh: Option<bool>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_ext::list(force_refresh.unwrap_or(false)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_extensions_install(source: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_ext::install(&source))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_extensions_uninstall(source: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || pi_ext::uninstall(&source))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_extensions_set_enabled(source: String, enabled: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || pi_ext::set_enabled(&source, enabled))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_extensions_update_one(source: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_ext::update_one(&source))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_extensions_update_all() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(pi_ext::update_all)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_extensions_catalog(
+    page: Option<u32>,
+    query: Option<String>,
+    kind: Option<String>,
+    sort: Option<String>,
+    refresh: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        pi_ext::catalog(
+            page.unwrap_or(1),
+            query.as_deref().unwrap_or(""),
+            kind.as_deref().unwrap_or(""),
+            sort.as_deref().unwrap_or("downloads"),
+            refresh.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_runtime_installations() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(pi_runtime::scan_installations)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_runtime_add_path(path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_runtime::add_custom_path(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_runtime_remove_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || pi_runtime::remove_custom_path(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_runtime_check_update() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(pi_runtime::check_update)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_runtime_update_pi() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(pi_runtime::update_pi)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_runtime_diagnostics() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(pi_runtime::run_diagnostics)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/* ------------------------------------------------------------------ */
+/*  系统打开能力                                                        */
+/* ------------------------------------------------------------------ */
+
+#[tauri::command]
+async fn shell_show_in_explorer(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || shell_open::show_in_explorer(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn shell_open_with_system(target: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || shell_open::open_with_system(&target))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn shell_open_in_vscode(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || shell_open::open_in_vscode(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn shell_open_capabilities() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| Ok(shell_open::open_capabilities()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(RpcProcess::new()).manage(workspace::WorkspaceState::default())
+        .setup(|app| {
+            // 托盘图标 + 菜单（打开 / 退出）。失败不阻塞启动——托盘是
+            // 增强能力，环境不支持时窗口应用仍应正常起来。
+            if let Err(error) = tray::setup(app.handle()) {
+                eprintln!("[wepi] 托盘初始化失败：{error}");
+            }
+            // 关闭行为拦截：tray 模式下点窗口关闭只隐藏，不退出。
+            let main = app.get_window("main");
+            if let Some(window) = main {
+                let handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        if tray::handle_close_requested(&handle) {
+                            api.prevent_close();
+                        }
+                    }
+                });
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             pi_rpc_start,
             pi_rpc_send,
             pi_rpc_stop,
             pi_rpc_stop_all,
             pi_rpc_wait_ready,
+            pi_rpc_prepare,
             pi_config_read,
             pi_config_write,
             pi_sessions_scan,
             pi_session_read,
-            pi_session_delete
+            pi_session_delete,
+            pi_mcp_snapshot,
+            pi_mcp_save,
+            pi_mcp_import_scan,
+            pi_mcp_import_apply,
+            pi_mcp_probe,
+            pi_skills_list,
+            pi_skills_read,
+            pi_skills_create,
+            pi_skills_write,
+            pi_skills_set_user_only,
+            pi_skills_rename,
+            pi_skills_delete,
+            pi_skills_store_search,
+            pi_skills_store_install,
+            pi_extensions_list,
+            pi_extensions_install,
+            pi_extensions_uninstall,
+            pi_extensions_set_enabled,
+            pi_extensions_update_one,
+            pi_extensions_update_all,
+            pi_extensions_catalog,
+            pi_runtime_installations,
+            pi_runtime_add_path,
+            pi_runtime_remove_path,
+            pi_runtime_check_update,
+            pi_runtime_update_pi,
+            pi_runtime_diagnostics,
+            shell_show_in_explorer,
+            shell_open_with_system,
+            shell_open_in_vscode,
+            shell_open_capabilities,
+            tray::close_behavior_get,
+            tray::close_behavior_set
             ,workspace::workspace_request, workspace::terminal_start, workspace::terminal_write, workspace::terminal_resize, workspace::terminal_close, workspace::browser_control
         ])
         .run(tauri::generate_context!())

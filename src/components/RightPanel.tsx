@@ -64,6 +64,11 @@ const actionClass =
 
 let sequence = 1;
 const basename = (value: string) => value.split(/[\\/]/).pop() || value;
+/**
+ * 原生网页视图右侧预留的空隙（逻辑像素）：伸缩把手需要这条无遮挡的
+ * 通道，否则子 webview 会吃掉把手上的鼠标事件（见 WebView.bounds）。
+ */
+const WEBVIEW_GUTTER = 10;
 
 /**
  * 文件树排序：先按路径逐段比较（父目录一定排在子节点前面，子节点紧跟自己父目录），
@@ -777,10 +782,20 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
     }
   };
 
+  /**
+   * 原生 webview 以窗口坐标叠加在 web UI 之上，会吃掉其矩形内的全部鼠标
+   * 事件——包括面板边缘 6px 宽的伸缩把手。这里把 webview 的右边界向内收
+   * WEBVIEW_GUTTER，给把手留出一条永久无遮挡的空隙（光标样式与拖拽因此
+   * 在网页标签下仍然可用，其它标签类型不受影响）。
+   */
   const bounds = useCallback(() => {
     const rect = content.current?.getBoundingClientRect();
     if (!rect || !isDesktopRuntime()) return;
-    void invoke('browser_control', { id, action: 'bounds', args: { x: rect.left, y: rect.top, width: rect.width, height: rect.height } });
+    void invoke('browser_control', {
+      id,
+      action: 'bounds',
+      args: { x: rect.left, y: rect.top, width: Math.max(1.0, rect.width - WEBVIEW_GUTTER), height: rect.height },
+    });
   }, [id]);
 
   useEffect(() => {
@@ -789,17 +804,28 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
     void invoke('browser_control', {
       id,
       action: 'create',
-      args: { url: tab.url, x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+      args: { url: tab.url, x: rect.left, y: rect.top, width: Math.max(1.0, rect.width - WEBVIEW_GUTTER), height: rect.height },
     }).catch(() => {});
     const observer = new ResizeObserver(bounds);
     observer.observe(content.current);
     window.addEventListener('resize', bounds);
+    // 页面加载事件（Rust on_page_load）驱动 loading 状态与地址栏同步。
+    let stopEvents: UnlistenFn | undefined;
+    void listen<{ id: string; url?: string; loading?: boolean }>('workspace-browser', (event) => {
+      if (event.payload.id !== id) return;
+      if (typeof event.payload.url === 'string' && event.payload.url) {
+        setUrl(event.payload.url);
+        onUrl(event.payload.url);
+      }
+      setLoading(event.payload.loading === true);
+    }).then((unlisten) => { stopEvents = unlisten; });
     return () => {
       observer.disconnect();
       window.removeEventListener('resize', bounds);
+      stopEvents?.();
       void invoke('browser_control', { id, action: 'close', args: {} }).catch(() => {});
     };
-  }, [id, tab.url, bounds]);
+  }, [id, tab.url, bounds, onUrl]);
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">

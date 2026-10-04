@@ -1,4 +1,4 @@
-import type { Message, Step, TermLine } from '../data';
+import type { Message, TurnBlock } from '../data';
 import type { PiSessionIndexEntry } from './piRpc';
 
 /**
@@ -74,71 +74,39 @@ const toolCallsOfContent = (value: unknown): ToolBlock[] =>
         .filter((call) => call.toolCallId)
     : [];
 
-function resultText(result: unknown): string {
-  if (!result) return '';
-  if (typeof result === 'string') return result;
-  if (Array.isArray(result)) return textOfContent(result);
-  if (typeof result === 'object') {
-    const record = result as Record<string, unknown>;
-    return textOfContent(record.content ?? record.output ?? record.text ?? '');
-  }
-  return String(result);
-}
-
-function describeCommand(toolName: string, args: Record<string, unknown>): string {
-  if (toolName === 'bash' || toolName === 'powershell') {
-    const cmd = typeof args.command === 'string' ? args.command : '';
-    return cmd || `${toolName} 命令`;
-  }
-  if (typeof args.path === 'string') return args.path;
-  if (typeof args.file_path === 'string') return args.file_path;
-  if (typeof args.pattern === 'string') return args.pattern;
-  const first = Object.values(args)[0];
-  return typeof first === 'string' ? first : toolName;
-}
-
-/** Step icon by tool name (mirrors PiDeck-style classification). */
-function stepIcon(toolName: string): Step['icon'] {
-  if (toolName === 'bash' || toolName === 'powershell' || toolName === 'shell') return 'command';
-  if (toolName === 'read' || toolName === 'ls' || toolName === 'find') return 'file';
-  if (toolName === 'edit' || toolName === 'write') return 'edit';
-  if (toolName === 'grep') return 'search';
-  return 'agent';
-}
-
-/** 把 toolcall/toolResult 对折叠为时间线步骤，文本块保留为正文。 */
-function stepsFromAssistant(
+/** 把 toolcall/toolResult 对折叠为时间线块，文本块保留为正文段。 */
+function blocksFromAssistant(
   entry: PiEntry,
   resultsById: Map<string, { result: unknown; isError?: boolean }>,
-): { content: string; thinking: string; steps: Step[]; edits: Message['edits'] } {
+): { text: string; blocks: TurnBlock[]; edits: Message['edits'] } {
   const content = entry.message?.content;
   const text = textOfContent(content);
   const thinking = thinkingOfContent(content);
   const calls = toolCallsOfContent(content);
-  const steps: Step[] = [];
+  const blocks: TurnBlock[] = [];
   const edits: Message['edits'] = [];
+  if (thinking) {
+    blocks.push({ kind: 'thinking', id: `think-${entry.id ?? blocks.length}`, text: thinking, running: false });
+  }
   for (const call of calls) {
     const outcome = resultsById.get(call.toolCallId);
-    const output = resultText(outcome?.result);
-    const label0 = describeCommand(call.toolName, call.args);
-    const isEdit = call.toolName === 'edit' || call.toolName === 'write';
-    const lines: TermLine[] = output ? output.split('\n').slice(-50).map((s) => ({ s })) : [];
-    steps.push({
+    blocks.push({
+      kind: 'tool',
       id: call.toolCallId,
-      kind: 'action',
-      icon: stepIcon(call.toolName),
-      label: `${call.toolName === 'bash' ? '已运行' : '已调用'} ${label0}`,
-      detail: {
-        kind: 'command',
-        command: label0,
-        lines: outcome?.isError ? lines.map((l) => ({ ...l, t: 'err' as const })) : lines,
-      },
+      toolName: call.toolName,
+      args: call.args,
+      result: outcome?.result,
+      running: false,
+      isError: outcome?.isError,
     });
-    if (isEdit && typeof call.args.path === 'string') {
+    if ((call.toolName === 'edit' || call.toolName === 'write') && typeof call.args.path === 'string') {
       edits.push({ file: call.args.path, add: 0, del: 0 });
     }
   }
-  return { content: text, thinking, steps, edits };
+  if (text) {
+    blocks.push({ kind: 'text', id: `text-${entry.id ?? blocks.length}`, text });
+  }
+  return { text, blocks, edits };
 }
 
 let seq = 0;
@@ -195,37 +163,68 @@ export function projectPiEntries(entries: PiEntry[]): Message[] {
       const text = textOfContent(message.content).trim();
       if (text) messages.push({ id: nextId(), role: 'user', content: text });
     } else if (message.role === 'assistant') {
-      const { content, thinking, steps, edits } = stepsFromAssistant(entry, resultsById);
+      const { text, blocks, edits } = blocksFromAssistant(entry, resultsById);
       // 一个回合内 Pi 会写入多条 assistant 消息（每次工具调用一轮）。
       // 与 pilo 的 ensure_assistant_start / PiDeck 的回合分组一致：
       // 两条 user 消息之间的所有 assistant 内容合并为同一个气泡，
       // 这样历史渲染与实时流式的观感才一致。
       const previous = messages[messages.length - 1];
       const canMerge = previous?.role === 'assistant';
-      const mergedText = canMerge && content
-        ? (previous.content ? `${previous.content}\n\n${content}` : content)
-        : content;
       if (canMerge) {
+        const mergedBlocks = [...(previous.blocks ?? []), ...blocks];
+        const normalized: TurnBlock[] = [];
+        for (const block of mergedBlocks) {
+          normalized.push(block);
+        }
+        // 叙述降级（与实时流式 reducer 同一规则）：其后还有工具调用的
+        // text 是过程叙述；只有最后一段（其后无工具）是最终回答。
+        const demoted = demoteNarrations(normalized);
+        const answerText = demoted
+          .filter((b): b is Extract<TurnBlock, { kind: 'text' }> => b.kind === 'text' && !(b as { narration?: boolean }).narration)
+          .map((b) => b.text)
+          .join('\n\n');
         messages[messages.length - 1] = {
           ...previous,
-          content: mergedText,
-          thinkingContent: [previous.thinkingContent, thinking].filter(Boolean).join('\n\n') || undefined,
-          steps: [...(previous.steps ?? []), ...steps].length ? [...(previous.steps ?? []), ...steps] : undefined,
+          content: answerText || previous.content,
+          blocks: demoted.length ? demoted : previous.blocks,
           edits: [...(previous.edits ?? []), ...(edits ?? [])].length ? [...(previous.edits ?? []), ...(edits ?? [])] : undefined,
         };
       } else {
+        const demoted = demoteNarrations(blocks);
+        const answerText = demoted
+          .filter((b): b is Extract<TurnBlock, { kind: 'text' }> => b.kind === 'text' && !(b as { narration?: boolean }).narration)
+          .map((b) => b.text)
+          .join('\n\n');
         messages.push({
           id: nextId(),
           role: 'assistant',
-          content,
-          thinkingContent: thinking || undefined,
-          steps: steps.length ? steps : undefined,
+          content: answerText || text,
+          blocks: demoted.length ? demoted : undefined,
           edits: edits?.length ? edits : undefined,
         });
       }
     }
   }
   return messages;
+}
+
+/**
+ * 叙述降级：回合内「其后还存在工具调用」的 text 块标记为 narration
+ * （折进时间线），最后一段 text 保持正文。与实时流式 reducer 的
+ * turn_end 降级规则等价——历史 JSONL 没有 turn 边界标记，用
+ * 「后面有没有工具」这一结构特征重建同样的归属。
+ */
+function demoteNarrations(blocks: TurnBlock[]): TurnBlock[] {
+  // 找到最后一个 tool 块的位置；其后的 text 是回答，之前的 text 是叙述。
+  let lastToolIndex = -1;
+  blocks.forEach((block, index) => {
+    if (block.kind === 'tool') lastToolIndex = index;
+  });
+  return blocks.map((block, index) => {
+    if (block.kind !== 'text') return block;
+    const isAfterLastTool = index > lastToolIndex;
+    return isAfterLastTool ? block : { ...block, narration: true };
+  });
 }
 
 /** 从索引条目生成标题：优先 Pi 会话名，其次首条用户消息预览。 */

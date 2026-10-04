@@ -15,11 +15,16 @@ import {
   GitCommitHorizontal,
   ExternalLink,
   CircleCheck,
+  Minimize2,
+  Boxes,
+  Terminal,
+  Cpu,
 } from 'lucide-react';
 import type { Thread } from '../data';
-import { Toggle, Popover, MenuItem, Kbd } from './ui';
+import { Toggle, Popover, MenuItem, Kbd, AppIcon } from './ui';
 import { Btn, Modal } from './kit';
-import { Logo } from './ui';
+import { closeBehaviorApi, openExternal, type CloseBehavior, adminErrorMessage } from '../lib/piAdmin';
+import { isDesktopRuntime } from '../lib/piRpc';
 import { cn } from '../utils/cn';
 
 export type ThemePref = 'dark' | 'light' | 'system';
@@ -166,6 +171,21 @@ export default function Settings({
   useEffect(() => localStorage.setItem('github-linked', String(githubLinked)), [githubLinked]);
   useEffect(() => localStorage.setItem('git-preferences', JSON.stringify(gitState)), [gitState]);
 
+  /* 关闭行为（Rust 托管：窗口关闭事件在 Rust 层拦截，必须读写 Rust 侧状态） */
+  const [closeBehavior, setCloseBehavior] = useState<CloseBehavior>('quit');
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    closeBehaviorApi.get().then((r) => setCloseBehavior(r.behavior)).catch(() => {});
+  }, []);
+  const changeCloseBehavior = (behavior: CloseBehavior) => {
+    setCloseBehavior(behavior);
+    if (!isDesktopRuntime()) return;
+    closeBehaviorApi.set(behavior).catch((error) => {
+      onToast(adminErrorMessage(error, '保存关闭行为失败'));
+      closeBehaviorApi.get().then((r) => setCloseBehavior(r.behavior)).catch(() => {});
+    });
+  };
+
   return (
     <div className="flex min-w-0 flex-1">
       <div className="flex w-[248px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--bg-side)]">
@@ -245,6 +265,25 @@ export default function Settings({
                 <Row title="默认采用完整视图" desc="开始新任务时，在同一标签页栏中显示聊天和内容">
                   <Toggle on={s.fullView} onChange={(v) => set('fullView', v)} />
                 </Row>
+              </Section>
+              <Section title="窗口">
+                <Row
+                  title="关闭行为"
+                  desc="点击窗口关闭按钮时的行为；选择「托盘运行」后，可从系统托盘图标重新打开 WEPI 或退出"
+                >
+                  <Select
+                    value={closeBehavior === 'tray' ? '托盘运行' : '退出 WEPI'}
+                    options={['退出 WEPI', '托盘运行']}
+                    onChange={(v) => changeCloseBehavior(v === '托盘运行' ? 'tray' : 'quit')}
+                  />
+                </Row>
+                {closeBehavior === 'tray' && (
+                  <Row title="托盘菜单" desc="右键托盘图标：「打开 WEPI / 退出 WEPI」；左键单击直接显示主窗口">
+                    <span className="flex items-center gap-1.5 text-[12.5px] text-[var(--text-3)]">
+                      <Minimize2 size={13} /> 后台运行中
+                    </span>
+                  </Row>
+                )}
               </Section>
               <Section title="通知">
                 <Row title="任务完成通知" desc="当后台任务完成或需要批准时发送系统通知">
@@ -447,32 +486,55 @@ export default function Settings({
 
           {page === '关于' && (
             <>
-              <div className="mb-8 flex items-center gap-4">
-                <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[var(--bg-hover)] text-[var(--text-2)]">
-                  <Logo size={38} />
-                </div>
-                <div>
-                  <div className="text-[21px] font-semibold tracking-[0.12em] text-[var(--text)]">WEPI</div>
-                  <div className="mt-1 text-[13px] text-[var(--text-2)]">开源 AI Agent 桌面工作台</div>
+              <div className="mb-10 flex flex-col items-center pt-4 text-center">
+                <AppIcon size={84} className="drop-shadow-[0_6px_24px_rgba(59,130,246,0.25)]" />
+                <div className="mt-4 text-[24px] font-semibold tracking-[0.18em] text-[var(--text)]">WEPI</div>
+                <div className="mt-1.5 text-[13px] text-[var(--text-2)]">开源 AI Agent 桌面工作台</div>
+                <div className="mt-3 flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-card)] px-3 py-1 text-[12px] text-[var(--text-2)]">
+                  <span className="size-1.5 rounded-full bg-[#3fb950]" />
+                  v0.1.0
                 </div>
               </div>
-              <Section title="应用信息">
-                <Row title="版本" desc="前端交互示例">
-                  <span className="font-mono text-[12.5px] text-[var(--text-2)]">0.1.0</span>
+
+              <Section title="技术栈">
+                <Row title="应用框架" desc="桌面容器与前端界面">
+                  <span className="flex items-center gap-1.5 text-[12.5px] text-[var(--text-2)]">
+                    <Boxes size={14} /> Tauri 2 · React 19
+                  </span>
                 </Row>
-                <Row title="构建方式" desc="桌面容器可由 Tauri 或 Electron 提供">
-                  <span className="text-[12.5px] text-[var(--text-2)]">React · Vite</span>
+                <Row title="Agent 运行时" desc="通过 stdio JSON-RPC 驱动 Pi Coding Agent">
+                  <span className="flex items-center gap-1.5 text-[12.5px] text-[var(--text-2)]">
+                    <Cpu size={14} /> Pi RPC
+                  </span>
                 </Row>
-                <Row title="开源许可" desc="以最终项目仓库中的 LICENSE 文件为准">
-                  <span className="text-[12.5px] text-[var(--text-2)]">待仓库确认</span>
+                <Row title="内置工具" desc="文件浏览、变更审查、终端与网页标签页">
+                  <span className="flex items-center gap-1.5 text-[12.5px] text-[var(--text-2)]">
+                    <Terminal size={14} /> 工作区面板
+                  </span>
                 </Row>
               </Section>
-              <Section title="链接">
-                <Row title="项目源码" desc="发布后可在此打开 GitHub 仓库。">
-                  <Btn onClick={() => onToast('请在项目发布后配置仓库链接')}><ExternalLink size={13} /> 项目主页</Btn>
+
+              <Section title="应用信息">
+                <Row title="版本" desc="语义化版本，随发布递增">
+                  <span className="font-mono text-[12.5px] text-[var(--text-2)]">0.1.0</span>
                 </Row>
-                <Row title="反馈问题" desc="欢迎提交 Bug 报告与功能建议。">
-                  <Btn onClick={() => onToast('请先配置项目的 GitHub Issues 地址')}><ExternalLink size={13} /> 报告问题</Btn>
+                <Row title="构建方式" desc="Rust 后端 + 单文件前端产物">
+                  <span className="font-mono text-[12.5px] text-[var(--text-2)]">Vite · singlefile</span>
+                </Row>
+                <Row title="开源许可" desc="本项目基于 MIT 许可开源">
+                  <span className="text-[12.5px] text-[var(--text-2)]">MIT</span>
+                </Row>
+              </Section>
+
+              <Section title="链接">
+                <Row title="项目主页" desc="GitHub 仓库与源码">
+                  <Btn onClick={() => openExternal('https://github.com/WEP-56/wepi', onToast)}><ExternalLink size={13} /> 项目主页</Btn>
+                </Row>
+                <Row title="反馈问题" desc="提交 Bug 报告与功能建议">
+                  <Btn onClick={() => openExternal('https://github.com/WEP-56/wepi/issues', onToast)}><ExternalLink size={13} /> 报告问题</Btn>
+                </Row>
+                <Row title="Pi 文档" desc="Pi Coding Agent 的官方文档与配置说明">
+                  <Btn onClick={() => openExternal('https://pi.dev', onToast)}><ExternalLink size={13} /> pi.dev</Btn>
                 </Row>
               </Section>
             </>

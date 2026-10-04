@@ -12,13 +12,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["unstable"] }
+tauri = { version = "2", features = ["unstable", "tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = "0.9"
 base64 = "0.22"
 similar = "2.7"
 ignore = "0.4"
+# WEPI 自管扩展管理用：抓取 pi.dev / skills.sh / npm registry 需要一个
+# 简单阻塞式 HTTP 客户端（只在 spawn_blocking 里调用）。
+ureq = { version = "2", features = ["json"] }
 
 [features]
 default = ["custom-protocol"]

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
   Folder,
   MoreHorizontal,
@@ -9,12 +9,13 @@ import {
   Undo2,
   Check,
   SquarePlus,
+  ArrowDown,
 } from 'lucide-react';
-import type { Message, Project, Thread, FileEdit, Step } from '../data';
-import { StepList, StepsDisclosure } from './Steps';
+import type { Message, Project, Thread, FileEdit, TurnBlock } from '../data';
+import { ActivityTimeline, streamingLabelOf } from './ActivityView';
 import Markdown from './Markdown';
 import MessageNavigator from './MessageNavigator';
-import { Logo, IconBtn } from './ui';
+import { AppIcon, IconBtn } from './ui';
 import { RenameInput } from './kit';
 import { cn } from '../utils/cn';
 
@@ -49,65 +50,81 @@ function EditCard({ edits, onView, onToast }: { edits: FileEdit[]; onView: () =>
   );
 }
 
-/** 没有时间线数据时，用产物信息兜底生成一条简单时间线 */
-function fallbackSteps(m: Message): Step[] {
-  return (m.edits ?? []).map((e) => ({
-    kind: 'action' as const,
-    icon: 'edit' as const,
-    label: `已编辑 ${e.file}`,
-    detail: {
-      kind: 'edit' as const,
-      file: e.file,
-      add: e.add,
-      del: e.del,
-      diff: [{ t: '+' as const, s: '（此处为示例界面，未包含完整差异）' }],
-    },
-  }));
+/** 旧数据（steps 模型）降级为 blocks 模型渲染，历史消息不改存储。 */
+function legacyBlocks(m: Message): TurnBlock[] {
+  const blocks: TurnBlock[] = [];
+  if (m.thinkingContent) {
+    blocks.push({ kind: 'thinking', id: `${m.id}-think`, text: m.thinkingContent, running: false });
+  }
+  for (const step of m.steps ?? []) {
+    if (step.kind !== 'action') continue;
+    const toolName =
+      step.icon === 'command' ? 'bash' :
+      step.icon === 'file' ? 'read' :
+      step.icon === 'edit' ? 'edit' :
+      step.icon === 'search' ? 'grep' : 'tool';
+    blocks.push({
+      kind: 'tool',
+      id: step.id ?? `${m.id}-step-${blocks.length}`,
+      toolName,
+      running: !!step.pending,
+      result: step.detail?.kind === 'command' ? { content: [{ type: 'text', text: step.detail.lines.map((l) => l.s).join('\n') }] } : undefined,
+    });
+  }
+  if (m.content) blocks.push({ kind: 'text', id: `${m.id}-text`, text: m.content });
+  return blocks;
 }
 
 function AssistantMsgBase({ m, onView, onToast, onLink }: { m: Message; onView: () => void; onToast: (s: string) => void; onLink: (href: string) => void }) {
-  const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
-  const steps = m.steps ?? fallbackSteps(m);
-  const hasSteps = steps.length > 0;
-  // 回合进行中：过程默认展开，让工具调用实时可见（PiDeck 的 process 分组同思路）。
-  const expanded = m.streaming ? true : open;
+  const blocks = m.blocks ?? legacyBlocks(m);
+  const streaming = !!m.streaming;
+  const label = streaming ? streamingLabelOf(blocks) : null;
+  // 正文 = 非 narration 的 text 块；narration（过程叙述）由时间线呈现。
+  const isNarration = (b: TurnBlock) => b.kind === 'text' && (b as Extract<TurnBlock, { kind: 'text' }> & { narration?: boolean }).narration === true;
+  const bodyBlocks = blocks.filter((b) => !isNarration(b));
+  const timelineBlocks = blocks; // 时间线内部自行过滤 narration
+
   return (
-    <div className="group">
-      {hasSteps && (
-        <>
-          <StepsDisclosure open={expanded} onToggle={() => setOpen((o) => !o)} duration={m.duration} steps={steps} running={m.streaming} />
-          {expanded && <StepList steps={steps} />}
-          {!m.streaming && <div className="my-3 h-px bg-[var(--border)]" />}
-        </>
+    <div className="group/msg">
+      {/* 回合过程：思考/工具/叙述按到达时序收在可折叠时间线里 */}
+      <ActivityTimeline blocks={timelineBlocks} streaming={streaming} duration={m.duration} />
+
+      {/* 起步指示：还没有任何块时的等待提示（pilo 的 starting 语义） */}
+      {streaming && blocks.length === 0 && (
+        <div className="shimmer-text px-1 py-1 text-[13px] font-medium">正在连接…</div>
       )}
-      {/* 思考是独立于正文的过程信息，折叠呈现；不再因为「正在思考」而隐藏已流出的正文。 */}
-      {(m.thinking || m.thinkingContent) && (
-        <div className="mb-2">
-          <div className={cn('text-[13px]', m.thinking && 'shimmer-text font-medium')}>{m.thinking ? '正在思考…' : '已思考'}</div>
-          {m.thinkingContent && (
-            <details className="mt-1" open={!!m.thinking}>
-              <summary className="cursor-default text-[12px] text-[var(--text-3)] hover:text-[var(--text-2)]">
-                {m.thinking ? '' : '查看思考过程'}
-              </summary>
-              <div className="mt-1.5 whitespace-pre-wrap border-l-2 border-[var(--border)] pl-2.5 text-[12.5px] leading-5 text-[var(--text-3)]">
-                {m.thinkingContent}
-              </div>
-            </details>
-          )}
+
+      {/* 正文：最终回答的 text 块逐段渲染，流式时带光标 */}
+      {bodyBlocks.map((block) =>
+        block.kind === 'text' ? (
+          <Markdown
+            key={block.id}
+            text={block.text}
+            caret={streaming}
+            onLink={onLink}
+          />
+        ) : null,
+      )}
+
+      {/* 流式状态行：思考/处理中的行内提示（不打断已有正文） */}
+      {streaming && label && blocks.length > 0 && (
+        <div className="mt-1 px-1 text-[12px] text-[var(--text-3)]">
+          <span className="shimmer-text">{label === 'thinking' ? '正在思考…' : '正在处理…'}</span>
         </div>
       )}
-      <Markdown text={m.content} caret={m.streaming} onLink={onLink} />
-      {m.edits && !m.streaming && <EditCard edits={m.edits} onView={onView} onToast={onToast} />}
-      {!m.streaming && (
-        <div className="mt-3 flex items-center gap-1 text-[var(--text-3)]">
+
+      {m.edits && !streaming && <EditCard edits={m.edits} onView={onView} onToast={onToast} />}
+      {!streaming && (
+        <div className="mt-2 flex items-center gap-1 text-[var(--text-3)] opacity-0 transition-opacity group-hover/msg:opacity-100">
           <button
             onClick={() => { navigator.clipboard?.writeText(m.content); setCopied(true); setTimeout(() => setCopied(false), 1200); }}
             className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[var(--bg-hover)] hover:text-[var(--text)]"
+            title="复制全文"
           >
             {copied ? <Check size={14} /> : <Copy size={14} />}
           </button>
-          <button onClick={() => onToast('已复制分享链接')} className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[var(--bg-hover)] hover:text-[var(--text)]">
+          <button onClick={() => onToast('已复制分享链接')} className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-[var(--bg-hover)] hover:text-[var(--text)]" title="分享">
             <Share size={14} />
           </button>
         </div>
@@ -131,7 +148,7 @@ export function EmptyState({ project, rightOpen, onToggleRight }: { project: Pro
           <SquarePlus size={15} />
         </IconBtn>
       </div>
-      <Logo size={50} className="text-[var(--text-2)]" />
+      <AppIcon size={50} className="opacity-90" />
       <h1 className="mt-5 text-center text-[28px] font-normal tracking-tight text-[var(--text)]">
         {project ? (
           <>
@@ -175,46 +192,89 @@ export default function ChatView({
   const ref = useRef<HTMLDivElement>(null);
   const moreRef = useRef<HTMLButtonElement>(null);
   const msgEls = useRef(new Map<string, HTMLDivElement>());
-  const stick = useRef(true);
+  /** 粘滞跟随所有权：following = 跟随底部；reading = 用户在阅读历史 */
+  const ownership = useRef<'following' | 'reading'>('following');
+  const [showToLatest, setShowToLatest] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
-  const last = thread.messages[thread.messages.length - 1];
 
   useEffect(() => {
-    stick.current = true;
+    ownership.current = 'following';
+    setShowToLatest(false);
     setActiveIdx(0);
     ref.current?.scrollTo({ top: ref.current.scrollHeight });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [thread.id]);
 
+  /** 单一滚动主人：ResizeObserver 在内容增长送达时同步钳制到 底部， */
+  /// 避免流式增长先画出一帧离底再补滚的跳动（pilo 同款策略）。
   useEffect(() => {
-    if (stick.current) ref.current?.scrollTo({ top: ref.current.scrollHeight });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [thread.messages.length]);
+    const viewport = ref.current;
+    if (!viewport || typeof ResizeObserver === 'undefined') return;
+    const content = viewport.firstElementChild;
+    if (!(content instanceof HTMLElement)) return;
+    let contentHeight: number | null = null;
+    let viewportHeight: number | null = null;
+    const clamp = () => {
+      if (ownership.current !== 'following') return;
+      const max = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      if (Math.abs(viewport.scrollTop - max) > 1) viewport.scrollTop = max;
+    };
+    const observer = new ResizeObserver((entries) => {
+      let changed = false;
+      for (const entry of entries) {
+        if (entry.target === viewport) {
+          if (viewportHeight === null) { viewportHeight = entry.contentRect.height; continue; }
+          if (Math.abs(entry.contentRect.height - viewportHeight) >= 0.5) { viewportHeight = entry.contentRect.height; changed = true; }
+        } else {
+          if (contentHeight === null) { contentHeight = entry.contentRect.height; continue; }
+          if (Math.abs(entry.contentRect.height - contentHeight) >= 0.5) { contentHeight = entry.contentRect.height; changed = true; }
+        }
+      }
+      if (changed) clamp();
+    });
+    observer.observe(viewport);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, []);
 
-  useEffect(() => {
-    if (stick.current) ref.current?.scrollTo({ top: ref.current.scrollHeight });
-  }, [last?.content]);
-
-  const updateActive = () => {
+  /** 滚动事件：用户向上离开底部即交出跟随权；贴底则收回。 */
+  const handleScroll = useCallback(() => {
     const box = ref.current;
     if (!box) return;
+    const max = Math.max(0, box.scrollHeight - box.clientHeight);
+    const distance = max - box.scrollTop;
+    const atBottom = distance < 24;
+    if (atBottom && ownership.current === 'reading') ownership.current = 'following';
+    else if (!atBottom && ownership.current === 'following') ownership.current = 'reading';
+    // 回到底部按钮的显隐（滞回阈值，避免临界抖动）。
+    const show = ownership.current === 'reading' && distance >= 96;
+    setShowToLatest((current) => (current !== show ? show : current));
+    // 导航高亮。
     const top = box.getBoundingClientRect().top;
     let idx = 0;
     thread.messages.forEach((m, i) => {
       const el = msgEls.current.get(m.id);
-      if (!el) return;
-      if (el.getBoundingClientRect().top - top <= 180) idx = i;
+      if (el && el.getBoundingClientRect().top - top <= 180) idx = i;
     });
     setActiveIdx(idx);
-    stick.current = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
-  };
+  }, [thread.messages]);
+
+  const scrollToBottom = useCallback((smooth = false) => {
+    const box = ref.current;
+    if (!box) return;
+    ownership.current = 'following';
+    setShowToLatest(false);
+    const max = Math.max(0, box.scrollHeight - box.clientHeight);
+    box.scrollTo({ top: max, behavior: smooth ? 'smooth' : 'auto' });
+  }, []);
 
   const jumpTo = (index: number) => {
     const box = ref.current;
     const m = thread.messages[index];
     const el = m ? msgEls.current.get(m.id) : undefined;
     if (!el || !box) return;
-    stick.current = index === thread.messages.length - 1;
+    ownership.current = index === thread.messages.length - 1 ? 'following' : 'reading';
+    setShowToLatest(ownership.current === 'reading');
     setActiveIdx(index);
     const top = box.scrollTop + (el.getBoundingClientRect().top - box.getBoundingClientRect().top) - 90;
     box.scrollTo({ top, behavior: 'smooth' });
@@ -259,23 +319,39 @@ export default function ChatView({
         </IconBtn>
       </div>
       <div className="relative min-h-0 flex-1">
-        <div ref={ref} onScroll={updateActive} className="scroll-thin h-full overflow-y-auto">
+        <div ref={ref} onScroll={handleScroll} className="scroll-thin h-full overflow-y-auto">
           <div className="mx-auto w-full max-w-[760px] pb-10 pl-12 pr-6 pt-6">
             {thread.messages.map((m) =>
               m.role === 'user' ? (
-                <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-8 flex scroll-mt-24 justify-end">
-                  <div className="max-w-[78%] whitespace-pre-wrap rounded-[22px] bg-[var(--bg-bubble)] px-4 py-3 text-[14px] leading-[24px] text-[var(--text)]">
-                    {m.content}
+                <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-6 flex scroll-mt-24 justify-end">
+                  <div className="group/u max-w-[78%]">
+                    <div className="whitespace-pre-wrap rounded-[20px] border border-[var(--border-strong)]/60 bg-[var(--bg-bubble)] px-4 py-3 text-[14px] leading-[24px] text-[var(--text)]">
+                      {m.content.length > 4000 ? `${m.content.slice(0, 4000)}…` : m.content}
+                    </div>
                   </div>
                 </div>
               ) : (
-                <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-6 scroll-mt-24">
+                <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-5 scroll-mt-24">
                   <AssistantMsg m={m} onView={onViewChanges} onToast={onToast} onLink={onOpenLink} />
                 </div>
               ),
             )}
           </div>
         </div>
+
+        {/* 回到底部按钮：仅跟随权在用户手里且离底较远时出现 */}
+        {showToLatest && thread.messages.length > 0 && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-4 flex justify-center pr-10">
+            <button
+              onClick={() => scrollToBottom(true)}
+              title="回到底部"
+              className="pointer-events-auto flex h-8 w-8 items-center justify-center rounded-full border border-[var(--border-strong)] bg-[var(--bg-elev)] text-[var(--text-2)] shadow-lg shadow-black/20 transition-[transform,opacity] hover:text-[var(--text)] active:scale-95"
+            >
+              <ArrowDown size={15} />
+            </button>
+          </div>
+        )}
+
         <MessageNavigator key={thread.id} messages={thread.messages} activeIndex={activeIdx} onJump={jumpTo} />
       </div>
     </div>

@@ -17,6 +17,7 @@ import {
   X,
   ClipboardPaste,
   TextSelect,
+  SquareCode,
 } from 'lucide-react';
 import TitleBar, { type MenuAction } from './components/TitleBar';
 import Sidebar, { Rail, type ViewId } from './components/Sidebar';
@@ -48,6 +49,7 @@ import {
 import { projectPiEntries, titleFromIndexEntry, type PiEntry } from './lib/piSession';
 import { applyPiEvent, createTurnState, displayContent, type PiTurnState } from './lib/piEventReducer';
 import { fileTarget, workspace, type PanelTarget, type Review } from './lib/workspace';
+import { shellApi, adminErrorMessage } from './lib/piAdmin';
 import type { UsageSnapshot } from './components/ContextUsage';
 import {
   efforts,
@@ -57,8 +59,6 @@ import {
   type Thread,
   type Project,
   type Provider,
-  type McpServer,
-  type Skill,
   type Message,
 } from './data';
 
@@ -154,8 +154,6 @@ export default function App() {
   const threads = store.threads;
   const expanded = store.expanded;
   const [providers, setProviders] = useState<Provider[]>([]);
-  const [mcp, setMcp] = useState<McpServer[]>([]);
-  const [skills, setSkills] = useState<Skill[]>([]);
   const [nav, setNav] = useState<NavState>({ view: 'home', threadId: null });
   const [back, setBack] = useState<NavState[]>([]);
   const [fwd, setFwd] = useState<NavState[]>([]);
@@ -187,7 +185,8 @@ export default function App() {
   const [piEfforts, setPiEfforts] = useState<readonly (typeof efforts)[number][]>(efforts);
   const [usage, setUsage] = useState<UsageSnapshot>({ contextPercent: 0, contextTokens: 0, contextWindow: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, totalCost: 0 });
   const [piConfigReady, setPiConfigReady] = useState(false);
-  const [piRuntimeInfo, setPiRuntimeInfo] = useState<{ agentDir?: string; piPath?: string; skillsCount: number; extensionsCount: number }>({ skillsCount: 0, extensionsCount: 0 });
+  /** 系统打开能力（VS Code 是否可用等）；桌面启动时探测一次 */
+  const [shellCapabilities, setShellCapabilities] = useState({ vscode: false });
 
   const timers = useRef<Record<string, number[]>>({});
   const toastTimer = useRef<number>(0);
@@ -210,11 +209,17 @@ export default function App() {
   }, []);
   useEffect(() => localStorage.setItem('theme', themePref), [themePref]);
   useEffect(() => localStorage.setItem('composer-settings', JSON.stringify(composer)), [composer]);
+  // 探测系统打开能力：VS Code 未安装时禁用对应菜单项而不是点击报错。
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    shellApi.capabilities()
+      .then((caps) => setShellCapabilities({ vscode: !!caps.vscodeAvailable }))
+      .catch(() => setShellCapabilities({ vscode: false }));
+  }, []);
   useEffect(() => {
     if (!isDesktopRuntime()) { setPiConfigReady(true); return; }
     void readPiConfig().then((snapshot) => {
       if (!snapshot) return;
-      setPiRuntimeInfo({ agentDir: snapshot.agentDir, piPath: snapshot.piPath, skillsCount: snapshot.skillsCount, extensionsCount: snapshot.extensionsCount });
       const entries = Object.entries(snapshot.models.providers ?? {});
       piModelsConfig.current = Object.fromEntries(entries.map(([id, value]) => [id, value as unknown as Record<string, unknown>]));
       const nextProviders: Provider[] = entries.map(([id, value]) => {
@@ -224,22 +229,6 @@ export default function App() {
         return { id, name, kind, baseUrl: value.baseUrl ?? '', api: value.api, headers: value.headers, compat: value.compat, apiKey: value.apiKey ?? snapshot.auth[id]?.key ?? '', enabled: true, models: (value.models ?? []).map((model) => model.id), modelDetails: Object.fromEntries((value.models ?? []).map((model) => [model.id, model])) };
       });
       setProviders(nextProviders);
-      const mcpServers = snapshot.mcp.mcpServers;
-      if (mcpServers && typeof mcpServers === 'object') {
-        setMcp(Object.entries(mcpServers as Record<string, Record<string, unknown>>).map(([id, server]) => ({
-          id,
-          name: id,
-          transport: typeof server.url === 'string' ? 'http' : 'stdio',
-          command: typeof server.command === 'string' ? server.command : '',
-          args: Array.isArray(server.args) ? server.args.join(' ') : typeof server.args === 'string' ? server.args : '',
-          url: typeof server.url === 'string' ? server.url : '',
-          env: server.env && typeof server.env === 'object' ? Object.entries(server.env as Record<string, unknown>).map(([key, value]) => `${key}=${String(value)}`).join('\n') : '',
-          enabled: true,
-          status: 'disabled',
-          tools: [],
-        })));
-      }
-      setSkills((snapshot.skills ?? []).map((name) => ({ id: name, name, description: '来自 Pi skills 目录', source: '用户', enabled: true, content: '' })));
       const settingsModel = typeof snapshot.settings.defaultProvider === 'string' && typeof snapshot.settings.defaultModel === 'string' ? `${snapshot.settings.defaultProvider}:${snapshot.settings.defaultModel}` : '';
       setComposer((current) => ({ ...current, model: settingsModel || current.model, effort: typeof snapshot.settings.defaultThinkingLevel === 'string' && (efforts as readonly string[]).includes(snapshot.settings.defaultThinkingLevel) ? snapshot.settings.defaultThinkingLevel as typeof efforts[number] : current.effort }));
       setPiConfigReady(true);
@@ -582,11 +571,30 @@ export default function App() {
     showToast('已恢复工作区，稍后会自动重新载入其会话');
   };
 
-  const openWithItems = (path?: string): CtxItem[] =>
-    ['VS Code', '文件资源管理器', '终端'].map((n) => ({
-      label: n,
-      onClick: () => showToast(`已在 ${n} 中打开 ${path ?? '工作区'}`),
-    }));
+  /** 「打开方式」子菜单：VS Code / 资源管理器，走系统命令真实打开。 */
+  const openWithItems = (path?: string): CtxItem[] => {
+    const items: CtxItem[] = [
+      {
+        label: 'VS Code',
+        icon: <SquareCode size={14} />,
+        disabled: !path || !shellCapabilities.vscode,
+        onClick: () => {
+          if (!path) return;
+          shellApi.openInVscode(path).catch((error) => showToast(adminErrorMessage(error, '无法用 VS Code 打开')));
+        },
+      },
+      {
+        label: '文件资源管理器',
+        icon: <FolderOpen size={14} />,
+        disabled: !path,
+        onClick: () => {
+          if (!path) return;
+          shellApi.showInExplorer(path).catch((error) => showToast(adminErrorMessage(error, '无法打开资源管理器')));
+        },
+      },
+    ];
+    return items;
+  };
 
   const threadMenu = (t: Thread, kind: 'sidebar' | 'header'): CtxItem[] => {
     const proj = projects.find((p) => p.id === t.projectId);
@@ -759,10 +767,8 @@ export default function App() {
           run.state = next;
           updateMsg(run.threadId, run.messageId, () => ({
             content: displayContent(next),
-            thinking: next.thinking,
+            blocks: next.blocks,
             streaming: next.streaming,
-            thinkingContent: next.thinkingContent || undefined,
-            steps: next.steps.length ? next.steps : undefined,
             ...(next.duration !== undefined ? { duration: next.duration } : {}),
           }));
         }
@@ -791,7 +797,6 @@ export default function App() {
         if (!run) return;
         piRuns.current.delete(run.rpcKey);
         updateMsg(run.threadId, run.messageId, (message) => ({
-          thinking: false,
           streaming: false,
           content: message.content || 'Pi RPC 进程已退出，请检查 Pi 配置和错误日志。',
         }));
@@ -804,7 +809,7 @@ export default function App() {
     let tid = activeThread?.id;
     const userMsg: Message = { id: uid(), role: 'user', content: text };
     const aid = uid();
-    const thinking: Message = { id: aid, role: 'assistant', content: '', thinking: true };
+    const placeholder: Message = { id: aid, role: 'assistant', content: '', blocks: [], streaming: true };
     // 新会话的工作目录取自所选项目——Pi 会话按 cwd 归档，必须一开始就绑定。
     const newThreadCwd = projects.find((p) => p.id === selectedProject)?.path ?? null;
     if (!tid) {
@@ -813,7 +818,7 @@ export default function App() {
         id: tid,
         title: text.split('\n')[0].slice(0, 24),
         projectId: selectedProject,
-        messages: [userMsg, thinking],
+        messages: [userMsg, placeholder],
         piCwd: newThreadCwd,
       };
       setThreads((ts) => [t, ...ts]);
@@ -824,7 +829,7 @@ export default function App() {
       setThreads((ts) => {
         const cur = ts.find((t) => t.id === id);
         if (!cur) return ts;
-        return [{ ...cur, messages: [...cur.messages, userMsg, thinking] }, ...ts.filter((t) => t.id !== id)];
+        return [{ ...cur, messages: [...cur.messages, userMsg, placeholder] }, ...ts.filter((t) => t.id !== id)];
       });
     }
     if (isDesktopRuntime()) {
@@ -843,10 +848,11 @@ export default function App() {
           mutate((prev) => ({ ...prev, threads: prev.threads.map((thread) => thread.id === rpcThreadId ? { ...thread, lastTurnId: turnId } : thread) }));
         }
         // 每个会话独立 RPC 进程；绑定相同 cwd+session 时复用。
-        await ensurePiSession({ sessionKey: rpcKey, cwd: workingDirectory, sessionPath });
+        // 握手式就绪：get_state 响应到达才算 RPC 循环可用（修复首条消息丢失）。
+        const handshake = await ensurePiSession({ sessionKey: rpcKey, cwd: workingDirectory, sessionPath });
         mutate((prev) => ({
           ...prev,
-          threads: prev.threads.map((t) => (t.id === rpcThreadId ? { ...t, rpcKey, piCwd: t.piCwd ?? workingDirectory } : t)),
+          threads: prev.threads.map((t) => (t.id === rpcThreadId ? { ...t, rpcKey, piCwd: t.piCwd ?? workingDirectory, piSessionPath: t.piSessionPath ?? handshake?.sessionFile ?? null } : t)),
         }));
         piRuns.current.set(rpcKey, { threadId: rpcThreadId, messageId: aid, rpcKey, turnId, cwd: workingDirectory, state: createTurnState(runStartedAt) });
         // 模型与思考档位由 Pi 持有。仅当本地选择确实存在于 Pi 的可用目录中时才下发，
@@ -881,7 +887,7 @@ export default function App() {
         piRuns.current.delete(rpcKey);
         const message = error instanceof Error ? error.message : 'Pi RPC 启动失败';
         showToast(message);
-        updateMsg(rpcThreadId, aid, () => ({ thinking: false, streaming: false, content: `发送失败：${message}` }));
+        updateMsg(rpcThreadId, aid, () => ({ streaming: false, content: `发送失败：${message}`, blocks: [{ kind: 'text', id: `${aid}-err`, text: `发送失败：${message}` }] }));
       });
       return;
     }
@@ -892,7 +898,7 @@ export default function App() {
     const reply = pickReply();
     const start = Date.now();
     const t1 = window.setTimeout(() => {
-      updateMsg(id, aid, () => ({ thinking: false, streaming: true }));
+      updateMsg(id, aid, () => ({ streaming: true }));
       let i = 0;
       const iv = window.setInterval(() => {
         i += 3;
@@ -1070,8 +1076,8 @@ export default function App() {
               onToast={showToast}
             />
           )}
-          {nav.view === 'mcp' && <McpPage servers={mcp} setServers={setMcp} onToast={showToast} />}
-          {nav.view === 'skills' && <SkillsPage skills={skills} setSkills={setSkills} onToast={showToast} />}
+          {nav.view === 'mcp' && <McpPage onToast={showToast} />}
+          {nav.view === 'skills' && <SkillsPage onToast={showToast} />}
           {nav.view === 'providers' && (
             <ProvidersPage
               providers={providers}
@@ -1081,7 +1087,7 @@ export default function App() {
               onToast={showToast}
             />
           )}
-          {nav.view === 'management' && <ManagementPage onToast={showToast} runtime={piRuntimeInfo} providerCount={providers.length} />}
+          {nav.view === 'management' && <ManagementPage onToast={showToast} />}
           {nav.view === 'home' && (
             <>
               {sidebarOpen && (

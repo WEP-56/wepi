@@ -42,6 +42,9 @@ function ensureEventListener() {
     }));
     unlisteners.push(await listen<string>('pi-rpc-exit', (event) => {
       const key = event.payload;
+      // 进程退出后复用记录立即失效：否则下次 ensure 会误判「已就绪」，
+      // 把消息发给一个不存在的进程（表现为切回会话再发消息必失败）。
+      startedSessions.delete(key);
       const handlers = key ? exitHandlers.get(key) : undefined;
       if (handlers) {
         for (const handler of [...handlers]) {
@@ -127,36 +130,50 @@ export interface PiSessionHandle {
   sessionPath: string | null;
 }
 
-const startedSessions = new Map<string, { sessionPath: string | null; generation: number }>();
+const startedSessions = new Map<string, { sessionPath: string | null; generation: number; prepared: boolean }>();
 let sessionGeneration = 0;
+
+export interface PiHandshakeInfo {
+  sessionId?: string;
+  sessionFile?: string;
+  model?: { id?: string; provider?: string; name?: string };
+  thinkingLevel?: string;
+}
 
 /**
  * 启动（或复用）一个绑定到指定工作目录与 Pi 会话文件的 RPC 进程。
  * 相同 sessionKey 复用已有进程；cwd / sessionPath 变化时自动重启。
+ *
+ * 就绪判定是握手式的：进程起来后必须完成一次 `get_state` 请求/响应
+ * （后端 pi_rpc_prepare），RPC 循环真正开始消费 stdin 才返回。
+ * 旧实现只等「第一行输出」——那行可能只是 Pi 的启动通知，此时发
+ * prompt 会被尚未就绪的循环丢弃，表现为「首次对话必失败，重发才可用」。
  */
 export async function ensurePiSession(options: {
   sessionKey: string;
   cwd?: string | null;
   sessionPath?: string | null;
   executable?: string;
-}): Promise<void> {
+}): Promise<PiHandshakeInfo | null> {
   if (!isDesktopRuntime()) throw new Error('Pi RPC 只能在桌面应用中启动');
   const { sessionKey, cwd, sessionPath, executable } = options;
   const existing = startedSessions.get(sessionKey);
-  if (existing && existing.sessionPath === (sessionPath ?? null)) {
-    return; // 进程已在运行且绑定相同会话文件
+  if (existing && existing.sessionPath === (sessionPath ?? null) && existing.prepared) {
+    return null; // 进程已运行且完成握手
   }
   if (existing) {
     await invoke('pi_rpc_stop', { sessionKey });
   }
-  startedSessions.set(sessionKey, { sessionPath: sessionPath ?? null, generation: ++sessionGeneration });
+  startedSessions.set(sessionKey, { sessionPath: sessionPath ?? null, generation: ++sessionGeneration, prepared: false });
   await invoke('pi_rpc_start', {
     sessionKey,
     executable: executable ?? 'pi',
     cwd: cwd ?? null,
     sessionPath: sessionPath ?? null,
   });
-  await invoke('pi_rpc_wait_ready', { timeoutMs: 20_000 });
+  const info = await invoke<PiHandshakeInfo>('pi_rpc_prepare', { sessionKey, timeoutMs: 30_000 });
+  startedSessions.set(sessionKey, { sessionPath: sessionPath ?? null, generation: ++sessionGeneration, prepared: true });
+  return info;
 }
 
 export async function sendPiRpc(record: PiRpcRecord, sessionKey?: string) {
