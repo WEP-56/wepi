@@ -1,0 +1,21 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+.npm-cache/
+.cargo-cache/
+.run/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Third-party reference repositories (kept locally, not tracked)
+example/
+# Local test scratch file
+src-tauri/test.txt
