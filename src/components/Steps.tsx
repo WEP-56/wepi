@@ -8,6 +8,7 @@ import {
   Sparkles,
   Copy,
   Check,
+  RefreshCw,
 } from 'lucide-react';
 import type { DiffLine, Step, StepDetail, TermLine } from '../data';
 import Markdown from './Markdown';
@@ -33,6 +34,8 @@ const stepIcon = (icon: Step['icon']) => {
       return Pencil;
     case 'search':
       return Search;
+    case 'retry':
+      return RefreshCw;
     default:
       return Sparkles;
   }
@@ -171,7 +174,11 @@ function ActionRow({ step, defaultOpen }: { step: Step; defaultOpen?: boolean })
           open && 'bg-[var(--bg-hover)]',
         )}
       >
-        <Icon size={13} strokeWidth={1.7} className="shrink-0 text-[var(--text-3)]" />
+        <Icon
+          size={13}
+          strokeWidth={1.7}
+          className={cn('shrink-0 text-[var(--text-3)]', step.pending && 'animate-spin text-[var(--blue)]')}
+        />
           <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--text-2)] group-hover/action:text-[var(--text)]">
           {step.label}
         </span>

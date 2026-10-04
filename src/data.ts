@@ -28,8 +28,10 @@ export interface Step {
   kind: 'text' | 'action';
   text?: string;
   label?: string;
-  icon?: 'file' | 'command' | 'edit' | 'search' | 'agent';
+  icon?: 'file' | 'command' | 'edit' | 'search' | 'agent' | 'retry';
   detail?: StepDetail;
+  /** 仍在进行中（如自动重试等待中）：渲染为旋转指示 */
+  pending?: boolean;
 }
 
 export interface Message {

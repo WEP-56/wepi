@@ -23,6 +23,8 @@ export interface PiTurnState {
   startedAt: number;
   /** 是否已收到 agent_settled（回合彻底结束） */
   finished: boolean;
+  /** 正在自动重试时的进度，供界面显示「重试中」状态 */
+  retrying?: { attempt: number; maxAttempts: number } | null;
 }
 
 export function createTurnState(startedAt: number): PiTurnState {
@@ -35,6 +37,7 @@ export function createTurnState(startedAt: number): PiTurnState {
     segmentStart: 0,
     startedAt,
     finished: false,
+    retrying: null,
   };
 }
 
@@ -179,6 +182,70 @@ export function applyPiEvent(state: PiTurnState, event: PiRpcEvent, now: number)
         finished: true,
         duration: Math.max(1, Math.round((now - state.startedAt) / 1000)),
       };
+    // ---- 自动重试 / 上下文压缩：作为过程步骤呈现（与 PiDeck 的 RetryStep 同思路）----
+    case 'auto_retry_start': {
+      const attempt = typeof event.attempt === 'number' ? event.attempt : 1;
+      const maxAttempts = typeof event.maxAttempts === 'number' ? event.maxAttempts : attempt;
+      const delayMs = typeof event.delayMs === 'number' ? event.delayMs : 0;
+      const reason = typeof event.errorMessage === 'string' ? event.errorMessage : '';
+      const stepId = `retry-${attempt}`;
+      const label = `请求失败，${Math.round(delayMs / 1000) || 1}s 后进行第 ${attempt}/${maxAttempts} 次重试…`;
+      const next: Step = {
+        id: stepId,
+        kind: 'action',
+        icon: 'retry',
+        label,
+        pending: true,
+        detail: reason ? { kind: 'note', text: reason } : undefined,
+      };
+      // 同一 attempt 重复到达时替换而不是追加，避免重试步骤堆积。
+      const existing = state.steps.findIndex((step) => step.id === stepId);
+      const steps = existing >= 0
+        ? state.steps.map((step, i) => (i === existing ? next : step))
+        : [...state.steps, next];
+      return { ...state, steps, retrying: { attempt, maxAttempts } };
+    }
+    case 'auto_retry_end': {
+      const attempt = typeof event.attempt === 'number' ? event.attempt : 1;
+      const success = event.success === true;
+      const finalError = typeof event.finalError === 'string' ? event.finalError : '';
+      const stepId = `retry-${attempt}`;
+      const steps = state.steps.map((step) => {
+        if (step.id !== stepId) return step;
+        return {
+          ...step,
+          pending: false,
+          label: success ? `第 ${attempt} 次重试成功` : `第 ${attempt} 次重试失败${finalError ? `：${finalError}` : ''}`,
+          detail: finalError ? ({ kind: 'note' as const, text: finalError }) : step.detail,
+        };
+      });
+      return { ...state, steps, retrying: null };
+    }
+    case 'compaction_start':
+      return {
+        ...state,
+        steps: [
+          ...state.steps,
+          {
+            id: `compaction-${state.steps.length}`,
+            kind: 'action',
+            icon: 'agent',
+            label: '正在压缩上下文…',
+            pending: true,
+            detail: { kind: 'note', text: '对话历史超出上下文窗口，Pi 正在生成摘要以继续。' },
+          },
+        ],
+      };
+    case 'compaction_end': {
+      const aborted = event.aborted === true;
+      const willRetry = event.willRetry === true;
+      const steps = state.steps.map((step, i) =>
+        step.pending && step.label === '正在压缩上下文…' && i === state.steps.length - 1
+          ? { ...step, pending: false, label: aborted ? '上下文压缩已取消' : willRetry ? '上下文压缩完成（将重试）' : '上下文压缩完成' }
+          : step,
+      );
+      return { ...state, steps };
+    }
     default:
       return state;
   }
