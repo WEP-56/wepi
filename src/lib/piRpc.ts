@@ -277,6 +277,15 @@ export function readPiSession(path: string) {
   return invoke<{ entries: Record<string, unknown>[] }>('pi_session_read', { path }).then((r) => r.entries ?? []);
 }
 
+/**
+ * 真正删除 Pi 会话文件（侧边栏「永久删除」必须落到磁盘，
+ * 否则下一轮会话索引扫描会把它重新导入）。
+ */
+export function deletePiSession(path: string) {
+  if (!isDesktopRuntime()) return Promise.resolve();
+  return invoke('pi_session_delete', { path });
+}
+
 /* ------------------------------------------------------------------ */
 /*  Pi 状态类型（get_state / get_entries 响应）                          */
 /* ------------------------------------------------------------------ */

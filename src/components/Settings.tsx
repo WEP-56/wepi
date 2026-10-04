@@ -108,6 +108,8 @@ export default function Settings({
   theme,
   onTheme,
   archived,
+  hiddenWorkspaces,
+  onRestoreWorkspace,
   onRestore,
   onDelete,
   onToast,
@@ -115,6 +117,8 @@ export default function Settings({
   theme: ThemePref;
   onTheme: (t: ThemePref) => void;
   archived: Thread[];
+  hiddenWorkspaces: string[];
+  onRestoreWorkspace: (path: string) => void;
   onRestore: (id: string) => void;
   onDelete: (id: string) => void;
   onToast: (s: string) => void;
@@ -319,17 +323,33 @@ export default function Settings({
           )}
 
           {page === '已归档任务' && (
-            <Section title={`已归档聊天（${archived.length}）`}>
-              {archived.length === 0 && <div className="px-4 py-8 text-center text-[13px] text-[var(--text-3)]">没有已归档的聊天</div>}
-              {archived.map((t) => (
-                <Row key={t.id} title={t.title} desc={`${t.messages.length} 条消息`}>
-                  <div className="flex items-center gap-2">
-                    <Btn onClick={() => { onRestore(t.id); onToast('已恢复聊天'); }}>恢复</Btn>
-                    <Btn variant="danger" onClick={() => setDeleteTarget(t)}><Trash2 size={13} /> 删除</Btn>
+            <>
+              <Section title={`已归档聊天（${archived.length}）`}>
+                {archived.length === 0 && <div className="px-4 py-8 text-center text-[13px] text-[var(--text-3)]">没有已归档的聊天</div>}
+                {archived.map((t) => (
+                  <Row key={t.id} title={t.title} desc={`${t.messages.length} 条消息`}>
+                    <div className="flex items-center gap-2">
+                      <Btn onClick={() => { onRestore(t.id); onToast('已恢复聊天'); }}>恢复</Btn>
+                      <Btn variant="danger" onClick={() => setDeleteTarget(t)}><Trash2 size={13} /> 删除</Btn>
+                    </div>
+                  </Row>
+                ))}
+              </Section>
+
+              {/* 移除项目只是隐藏该工作区（Pi 会话文件仍在磁盘上），这里提供恢复入口 */}
+              {hiddenWorkspaces.length > 0 && (
+                <Section title={`已移除的工作区（${hiddenWorkspaces.length}）`}>
+                  <div className="px-4 pt-3 text-[12.5px] text-[var(--text-3)]">
+                    这些工作区已从侧边栏移除，其 Pi 会话文件仍保留在磁盘上。
                   </div>
-                </Row>
-              ))}
-            </Section>
+                  {hiddenWorkspaces.map((path) => (
+                    <Row key={path} title={path.split(/[\\/]/).filter(Boolean).pop() ?? path} desc={path}>
+                      <Btn onClick={() => onRestoreWorkspace(path)}>恢复</Btn>
+                    </Row>
+                  ))}
+                </Section>
+              )}
+            </>
           )}
 
           {page === 'GitHub' && (

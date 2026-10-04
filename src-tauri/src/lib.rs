@@ -314,6 +314,36 @@ async fn pi_session_read(path: String) -> Result<Value, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// 校验并解析待删除的会话文件路径。
+/// 只接受 sessions 目录下的 .jsonl 文件，避免误删任意路径。
+fn resolve_deletable_session(path: &str, root: &Path) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(root).map_err(|e| format!("无法定位 Pi sessions 目录：{e}"))?;
+    let target = PathBuf::from(path);
+    if target.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return Err("只允许删除 .jsonl 会话文件".to_owned());
+    }
+    let canonical = fs::canonicalize(&target).map_err(|e| format!("无法定位会话文件：{e}"))?;
+    if !canonical.starts_with(&root) {
+        return Err("拒绝删除 Pi sessions 目录之外的文件".to_owned());
+    }
+    Ok(canonical)
+}
+
+/// 真正删除一个 Pi 会话文件。
+///
+/// 侧边栏的「永久删除」必须落到磁盘上，否则会话索引下一轮扫描会把它重新
+/// 导入，用户看到的就是「删了又回来了」。
+#[tauri::command]
+async fn pi_session_delete(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = pi_sessions_dir();
+        let canonical = resolve_deletable_session(&path, &root)?;
+        fs::remove_file(&canonical).map_err(|e| format!("删除会话文件失败：{e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn message_text_from(message: &Value) -> Option<String> {
     match message.get("content")? {
         Value::String(text) => Some(text.clone()),
@@ -335,6 +365,27 @@ fn message_text_from(message: &Value) -> Option<String> {
 /* ------------------------------------------------------------------ */
 /*  RPC 事件归一化                                                      */
 /* ------------------------------------------------------------------ */
+
+/// 把归一化后的事件打上来源会话键。
+///
+/// 必须在 `normalize_rpc_record` **之后**调用：归一化会为文本/思考/工具事件
+/// 新建 JSON 对象（如 `assistant_text_delta`），提前打标会在新建时丢掉键，
+/// 前端按会话路由时就只能收到原样透传的事件（工具步骤），文本全部被丢弃。
+fn stamp_session_key(event: &mut Value, session_key: &str) {
+    if let Some(obj) = event.as_object_mut() {
+        obj.insert("__sessionKey".into(), Value::String(session_key.to_owned()));
+    }
+}
+
+fn normalized_events_with_key(record: Value, session_key: &str) -> Vec<Value> {
+    normalize_rpc_record(record)
+        .into_iter()
+        .map(|mut event| {
+            stamp_session_key(&mut event, session_key);
+            event
+        })
+        .collect()
+}
 
 fn normalize_rpc_record(record: Value) -> Vec<Value> {
     let Some(kind) = record.get("type").and_then(Value::as_str) else {
@@ -611,14 +662,8 @@ fn start_process_blocking(
                     }
                     ready_out.1.notify_all();
                     match serde_json::from_str::<Value>(&line) {
-                        Ok(mut value) => {
-                            if let Some(obj) = value.as_object_mut() {
-                                obj.insert(
-                                    "__sessionKey".into(),
-                                    Value::String(key_for_reader.clone()),
-                                );
-                            }
-                            for event in normalize_rpc_record(value) {
+                        Ok(value) => {
+                            for event in normalized_events_with_key(value, &key_for_reader) {
                                 if sender.send(Ok(event)).is_err() {
                                     return;
                                 }
@@ -872,6 +917,70 @@ mod tests {
         }));
         assert_eq!(events[0]["type"], json!("message_update"));
     }
+
+    #[test]
+    fn every_normalized_event_carries_its_session_key() {
+        // 回归：键必须在归一化之后打上。归一化会新建文本/思考事件对象，
+        // 若提前打标，这些事件会丢掉会话键，前端按会话路由时会把整段
+        // 正文丢弃（只有原样透传的工具事件能到达）。
+        let cases = vec![
+            json!({"type":"message_start","message":{"role":"assistant"}}),
+            json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hi"}}),
+            json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"hmm"}}),
+            json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}),
+            json!({"type":"tool_execution_start","toolCallId":"c1","toolName":"read"}),
+            json!({"type":"agent_settled"}),
+            json!({"type":"response","id":"x","success":true}),
+        ];
+        for case in cases {
+            let events = normalized_events_with_key(case.clone(), "rpc-abc");
+            assert!(!events.is_empty(), "case produced no events: {case}");
+            for event in &events {
+                assert_eq!(
+                    event.get("__sessionKey").and_then(Value::as_str),
+                    Some("rpc-abc"),
+                    "event lost its session key: {event}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_delta_survives_normalization_with_its_payload() {
+        let events = normalized_events_with_key(
+            json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"你好"}}),
+            "k",
+        );
+        assert_eq!(events[0]["type"], json!("assistant_text_delta"));
+        assert_eq!(events[0]["delta"], json!("你好"));
+        assert_eq!(events[0]["__sessionKey"], json!("k"));
+    }
+
+    #[test]
+    fn session_delete_is_confined_to_the_sessions_directory() {
+        let root = std::env::temp_dir().join(format!("wepi-del-test-{}", std::process::id()));
+        let nested = root.join("--E--proj--");
+        fs::create_dir_all(&nested).unwrap();
+        let inside = nested.join("s.jsonl");
+        fs::write(&inside, "{}").unwrap();
+        let outside = root.parent().unwrap().join(format!(
+            "wepi-outside-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&outside, "{}").unwrap();
+
+        // 目录内 .jsonl：允许
+        assert!(resolve_deletable_session(&inside.to_string_lossy(), &root).is_ok());
+        // 目录外：拒绝
+        assert!(resolve_deletable_session(&outside.to_string_lossy(), &root).is_err());
+        // 非 .jsonl：拒绝
+        let txt = nested.join("s.txt");
+        fs::write(&txt, "x").unwrap();
+        assert!(resolve_deletable_session(&txt.to_string_lossy(), &root).is_err());
+
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -887,7 +996,8 @@ pub fn run() {
             pi_config_read,
             pi_config_write,
             pi_sessions_scan,
-            pi_session_read
+            pi_session_read,
+            pi_session_delete
         ])
         .run(tauri::generate_context!())
         .expect("error while running WEPI");

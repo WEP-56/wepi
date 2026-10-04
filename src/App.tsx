@@ -33,6 +33,7 @@ import { ContextMenu, type CtxItem } from './components/ContextMenu';
 import { startDrag } from './components/Resizer';
 import { ProjectDialog, ConfirmDialog, ScheduleDialog } from './components/Dialogs';
 import {
+  deletePiSession,
   ensurePiSession,
   isDesktopRuntime,
   listenPiRpc,
@@ -42,11 +43,12 @@ import {
   scanPiSessions,
   sendPiRpc,
   stopPiRpc,
+  stopPiSession,
   writePiConfig,
 } from './lib/piRpc';
 import { projectPiEntries, titleFromIndexEntry, type PiEntry } from './lib/piSession';
+import { applyPiEvent, createTurnState, displayContent, type PiTurnState } from './lib/piEventReducer';
 import type { UsageSnapshot } from './components/ContextUsage';
-import type { StepDetail } from './data';
 import {
   efforts,
   buildModelOptions,
@@ -87,12 +89,17 @@ interface PersistedStore {
   projects: Project[];
   threads: Thread[];
   expanded: string[];
+  /** 已移除的工作区（归一化路径）：阻止会话索引把它们重新导回来 */
+  hiddenWorkspaces: string[];
 }
+
+/** 工作区路径归一化，用于跨平台比较 */
+const normalizeWorkspace = (value: string) => value.replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase();
 
 function loadStore(): PersistedStore {
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (!raw) return { projects: [], threads: [], expanded: [] };
+    if (!raw) return { projects: [], threads: [], expanded: [], hiddenWorkspaces: [] };
     const parsed = JSON.parse(raw) as Partial<PersistedStore>;
     // 恢复时清掉运行时标志（streaming/thinking 属于上次进程的瞬态）。
     const revive = (m: Message): Message => ({ ...m, streaming: false, thinking: false });
@@ -100,9 +107,14 @@ function loadStore(): PersistedStore {
       ...t,
       messages: (t.messages ?? []).map((m) => (m.role === 'assistant' ? revive(m) : m)),
     }));
-    return { projects: parsed.projects ?? [], threads, expanded: parsed.expanded ?? [] };
+    return {
+      projects: parsed.projects ?? [],
+      threads,
+      expanded: parsed.expanded ?? [],
+      hiddenWorkspaces: parsed.hiddenWorkspaces ?? [],
+    };
   } catch {
-    return { projects: [], threads: [], expanded: [] };
+    return { projects: [], threads: [], expanded: [], hiddenWorkspaces: [] };
   }
 }
 
@@ -184,7 +196,7 @@ export default function App() {
   navRef.current = nav;
   const lastHome = useRef<string | null>(null);
   /** 正在进行的回合：按 RPC 会话键索引，支持多会话并行运行 */
-  const piRuns = useRef(new Map<string, { threadId: string; messageId: string; startedAt: number; rpcKey: string; segmentStart: number; contentLen: number }>());
+  const piRuns = useRef(new Map<string, { threadId: string; messageId: string; rpcKey: string; state: PiTurnState }>());
   const piModelsConfig = useRef<Record<string, Record<string, unknown>>>({});
   /** 会话打开请求的代际号，防止旧请求覆盖新导航 */
   const openGeneration = useRef(0);
@@ -241,7 +253,7 @@ export default function App() {
   useEffect(() => {
     if (!isDesktopRuntime()) return;
     let cancelled = false;
-    const normalizePath = (value: string) => value.replace(/[\\/]+$/, '').toLowerCase();
+    const normalizePath = normalizeWorkspace;
     const baseName = (value: string) => value.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || value;
     const merge = () => {
       void scanPiSessions().then((sessions) => {
@@ -249,6 +261,7 @@ export default function App() {
         mutate((prev) => {
           const projects = [...prev.projects];
           const byPath = new Map(projects.map((p) => [normalizePath(p.path), p]));
+          const hidden = new Set(prev.hiddenWorkspaces);
           const threads = [...prev.threads];
           let changed = false;
           for (const entry of sessions) {
@@ -256,6 +269,8 @@ export default function App() {
             // 使侧边栏呈现「项目 › 会话」的结构，而不是全部堆在「最近」。
             // cwd 只取会话文件首行的权威值；目录名解码是有损的，不作为来源。
             const cwd = entry.cwd ?? null;
+            // 已被用户移除的工作区不再导入，否则「移除」会被下一轮扫描撤销。
+            if (cwd && hidden.has(normalizePath(cwd))) continue;
             let projectId: string | null = null;
             if (cwd) {
               const key = normalizePath(cwd);
@@ -471,16 +486,32 @@ export default function App() {
   };
 
   const deleteThread = (id: string) => {
+    const thread = threads.find((t) => t.id === id);
     setThreads((ts) => ts.filter((t) => t.id !== id));
     if (nav.threadId === id) setNav({ view: 'home', threadId: null });
-    showToast('已永久删除聊天');
+    if (!isDesktopRuntime() || !thread?.piSessionPath) {
+      showToast('已永久删除聊天');
+      return;
+    }
+    const sessionPath = thread.piSessionPath;
+    const rpcKey = thread.rpcKey;
+    void (async () => {
+      // 必须先停掉仍在写这个会话文件的 Pi 进程，否则它会立刻把文件重新落盘。
+      if (rpcKey) await stopPiSession(rpcKey);
+      await deletePiSession(sessionPath);
+      showToast('已删除对话及其 Pi 会话文件');
+    })().catch((error: unknown) => {
+      showToast(`删除 Pi 会话文件失败：${error instanceof Error ? error.message : String(error)}`);
+    });
   };
 
   const confirmDelete = (t: Thread) =>
     setDialog({
       kind: 'confirm',
       title: '永久删除聊天？',
-      desc: `「${t.title}」将被永久删除，此操作无法撤销。如只想隐藏它，可以选择「归档」。`,
+      desc: t.piSessionPath
+        ? `「${t.title}」将被永久删除，同时会删除磁盘上的 Pi 会话文件（${t.piSessionPath}）。此操作无法撤销，如只想隐藏它，可以选择「归档」。`
+        : `「${t.title}」将被永久删除，此操作无法撤销。如只想隐藏它，可以选择「归档」。`,
       label: '永久删除',
       onConfirm: () => deleteThread(t.id),
     });
@@ -519,11 +550,29 @@ export default function App() {
     showToast(`已创建项目 ${name}`);
   };
 
+  /**
+   * 移除项目 = 隐藏该工作区。
+   * Pi 会话是磁盘上的独立文件，只要文件还在，会话索引下一轮就会把它重新
+   * 导进来、并把项目重新建出来。因此这里记录一条隐藏规则（持久化），
+   * 而不是仅仅从内存里删掉——这才是用户期望的「移除」。
+   */
   const removeProject = (p: Project) => {
-    setProjects((ps) => ps.filter((x) => x.id !== p.id));
-    setThreads((ts) => ts.map((t) => (t.projectId === p.id ? { ...t, projectId: null } : t)));
+    const key = normalizeWorkspace(p.path);
+    mutate((prev) => ({
+      ...prev,
+      projects: prev.projects.filter((x) => x.id !== p.id),
+      threads: prev.threads.filter((t) => t.projectId !== p.id),
+      hiddenWorkspaces: prev.hiddenWorkspaces.includes(key) ? prev.hiddenWorkspaces : [...prev.hiddenWorkspaces, key],
+    }));
     if (selectedProject === p.id) setSelectedProject(null);
-    showToast(`已移除项目 ${p.name}`);
+    showToast(`已移除项目 ${p.name}（Pi 会话文件保留在磁盘）`);
+  };
+
+  /** 取消隐藏：会话索引下一轮扫描会重新导入该工作区及其会话。 */
+  const restoreWorkspace = (path: string) => {
+    const key = normalizeWorkspace(path);
+    mutate((prev) => ({ ...prev, hiddenWorkspaces: prev.hiddenWorkspaces.filter((x) => x !== key) }));
+    showToast('已恢复工作区，稍后会自动重新载入其会话');
   };
 
   const openWithItems = (path?: string): CtxItem[] =>
@@ -698,104 +747,20 @@ export default function App() {
         const sessionKey = typeof record.__sessionKey === 'string' ? record.__sessionKey : undefined;
         const run = sessionKey ? piRuns.current.get(sessionKey) : undefined;
         if (!run) return;
-        const event = record.type;
-        const assistantEvent = (record.assistantMessageEvent ?? {}) as Record<string, unknown>;
-        const textFromContent = (value: unknown) => Array.isArray(value)
-          ? value.filter((block): block is Record<string, unknown> => !!block && typeof block === 'object' && block.type === 'text').map((block) => typeof block.text === 'string' ? block.text : '').join('')
-          : typeof value === 'string' ? value : '';
-        const appendText = (delta: string) => updateMsg(run.threadId, run.messageId, (message) => {
-          run.contentLen = message.content.length + delta.length;
-          return { thinking: false, streaming: true, content: message.content + delta };
-        });
-        const appendThinking = (delta: string) => updateMsg(run.threadId, run.messageId, (message) => ({ thinking: true, streaming: true, thinkingContent: (message.thinkingContent ?? '') + delta }));
-
-        if (event === 'assistant_text_delta') {
-          if (typeof record.delta === 'string' && record.delta) appendText(record.delta);
-        } else if (event === 'assistant_thinking_start') {
-          updateMsg(run.threadId, run.messageId, () => ({ thinking: true, streaming: true }));
-        } else if (event === 'assistant_thinking_delta') {
-          if (typeof record.delta === 'string' && record.delta) appendThinking(record.delta);
-        } else if (event === 'assistant_thinking_end') {
-          updateMsg(run.threadId, run.messageId, () => ({ thinking: false, streaming: true }));
-        } else if (event === 'assistant_message_start') {
-          // 记录本段起点：一个回合可能包含多条 assistant 消息（工具循环）。
-          updateMsg(run.threadId, run.messageId, (message) => {
-            run.segmentStart = message.content.length;
-            run.contentLen = message.content.length;
-            return { thinking: true, streaming: true };
-          });
-        } else if (event === 'user_message_start') {
-          // Pi may echo the accepted user message; the local optimistic message is authoritative.
-        } else if (event === 'message_update') {
-          if (assistantEvent.type === 'text_delta' && typeof assistantEvent.delta === 'string' && assistantEvent.delta) {
-            appendText(assistantEvent.delta);
-          } else if (assistantEvent.type === 'thinking_start') {
-            updateMsg(run.threadId, run.messageId, () => ({ thinking: true, streaming: true }));
-          } else if (assistantEvent.type === 'thinking_delta' && typeof assistantEvent.delta === 'string' && assistantEvent.delta) {
-            appendThinking(assistantEvent.delta);
-          } else if (assistantEvent.type === 'thinking_end') {
-            updateMsg(run.threadId, run.messageId, () => ({ thinking: false, streaming: true }));
-          }
-        } else if (event === 'assistant_message_end' || (event === 'message_end' && (record.message as Record<string, unknown> | undefined)?.role === 'assistant')) {
-          // 段落级校正：用 Pi 落盘的该段最终文本替换本段流式累积结果，
-          // 既补回丢块，也不会把上一段内容重复一遍。
-          const finalText = textFromContent((record.message as Record<string, unknown> | undefined)?.content);
-          if (finalText) {
-            updateMsg(run.threadId, run.messageId, (message) => {
-              const head = message.content.slice(0, run.segmentStart);
-              run.contentLen = head.length + finalText.length;
-              return { content: head + finalText, thinking: false, streaming: true };
-            });
-          } else {
-            updateMsg(run.threadId, run.messageId, () => ({ thinking: false, streaming: true }));
-          }
-        } else if (event === 'tool_execution_start') {
-          const toolName = typeof record.toolName === 'string' ? record.toolName : '工具';
-          const toolCallId = typeof record.toolCallId === 'string' ? record.toolCallId : uid();
-          const args = record.args as Record<string, unknown> | undefined;
-          const command = typeof args?.command === 'string' ? args.command
-            : typeof args?.path === 'string' ? `${toolName} ${args.path}`
-            : typeof args?.pattern === 'string' ? `${toolName} ${args.pattern}`
-            : `${toolName}…`;
-          const icon = toolName === 'bash' || toolName === 'powershell' || toolName === 'shell' ? 'command'
-            : toolName === 'read' || toolName === 'ls' || toolName === 'find' ? 'file'
-            : toolName === 'edit' || toolName === 'write' ? 'edit'
-            : toolName === 'grep' ? 'search'
-            : 'agent';
-          updateMsg(run.threadId, run.messageId, (message) => ({
-            thinking: false,
-            streaming: true,
-            steps: [...(message.steps ?? []), { id: toolCallId, kind: 'action', icon, label: `${icon === 'command' ? '已运行' : '已调用'} ${command}`, detail: { kind: 'command', command, lines: [] } satisfies StepDetail }],
+        // 回合状态由纯函数归约器推进，事件处理不再直接改 ref。
+        const next = applyPiEvent(run.state, record, Date.now());
+        if (next !== run.state) {
+          run.state = next;
+          updateMsg(run.threadId, run.messageId, () => ({
+            content: displayContent(next),
+            thinking: next.thinking,
+            streaming: next.streaming,
+            thinkingContent: next.thinkingContent || undefined,
+            steps: next.steps.length ? next.steps : undefined,
+            ...(next.duration !== undefined ? { duration: next.duration } : {}),
           }));
-        } else if (event === 'tool_execution_update') {
-          const toolCallId = typeof record.toolCallId === 'string' ? record.toolCallId : '';
-          const output = textFromContent((record.partialResult as Record<string, unknown> | undefined)?.content ?? record.partialResult);
-          if (toolCallId && output) updateMsg(run.threadId, run.messageId, (message) => ({ steps: (message.steps ?? []).map((step) => step.id !== toolCallId || step.detail?.kind !== 'command' ? step : { ...step, detail: { ...step.detail, lines: output.split('\n').map((line) => ({ s: line })) } }) }));
-        } else if (event === 'tool_execution_end') {
-          const toolCallId = typeof record.toolCallId === 'string' ? record.toolCallId : '';
-          const result = record.result as Record<string, unknown> | undefined;
-          const output = textFromContent(result?.content ?? result);
-          if (toolCallId) updateMsg(run.threadId, run.messageId, (message) => ({
-            steps: (message.steps ?? []).map((step) => step.id !== toolCallId || step.detail?.kind !== 'command' ? step : {
-              ...step,
-              label: step.label,
-              detail: { ...step.detail, lines: (output || []).length ? output.split('\n').map((line) => ({ s: line, t: record.isError ? 'err' as const : undefined })) : step.detail?.kind === 'command' ? step.detail.lines : [] },
-            }),
-          }));
-        } else if (event === 'rpc_message') {
-          const message = record.message as Record<string, unknown> | undefined;
-          if (message?.success === false && String(message.id ?? '').startsWith('wepi-')) {
-            updateMsg(run.threadId, run.messageId, () => ({ thinking: false, streaming: false, content: `Pi RPC 请求失败：${String(message.error ?? '未知错误')}` }));
-          }
-        } else if (event === 'agent_settled') {
-          // 只有 agent_settled 代表回合彻底结束；agent_end 仅是元数据（pilo 同此约定），
-          // 若在 agent_end 就收尾会把尾部文本截断。
-          updateMsg(run.threadId, run.messageId, (message) => ({
-            thinking: false,
-            streaming: false,
-            duration: Math.max(1, Math.round((Date.now() - run.startedAt) / 1000)),
-            content: message.content || '（Pi 未返回文本）',
-          }));
+        }
+        if (record.type === 'agent_settled' && next.finished) {
           if (navRef.current.threadId !== run.threadId || navRef.current.view !== 'home')
             setThreads((ts) => ts.map((thread) => thread.id === run.threadId ? { ...thread, unread: true } : thread));
           piRuns.current.delete(run.rpcKey);
@@ -865,7 +830,7 @@ export default function App() {
           ...prev,
           threads: prev.threads.map((t) => (t.id === rpcThreadId ? { ...t, rpcKey, piCwd: t.piCwd ?? workingDirectory } : t)),
         }));
-        piRuns.current.set(rpcKey, { threadId: rpcThreadId, messageId: aid, startedAt: runStartedAt, rpcKey, segmentStart: 0, contentLen: 0 });
+        piRuns.current.set(rpcKey, { threadId: rpcThreadId, messageId: aid, rpcKey, state: createTurnState(runStartedAt) });
         // 模型与思考档位由 Pi 持有。仅当本地选择确实存在于 Pi 的可用目录中时才下发，
         // 否则沿用 Pi 自己的配置——避免陈旧/拼错的模型导致 "Model not found"。
         const catalog = await requestPiRpc<{ models?: { id: string; name?: string; provider: string }[] }>(
@@ -1078,6 +1043,8 @@ export default function App() {
               theme={themePref}
               onTheme={setThemePref}
               archived={threads.filter((t) => t.archived)}
+              hiddenWorkspaces={store.hiddenWorkspaces}
+              onRestoreWorkspace={restoreWorkspace}
               onRestore={(id) => {
                 patchThread(id, { archived: false });
                 showToast('已恢复聊天');
