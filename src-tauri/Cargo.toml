@@ -22,6 +22,9 @@ ignore = "0.4"
 # WEPI 自管扩展管理用：抓取 pi.dev / skills.sh / npm registry 需要一个
 # 简单阻塞式 HTTP 客户端（只在 spawn_blocking 里调用）。
 ureq = { version = "2", features = ["json"] }
+# 原生目录/文件选择对话框（系统风格，替代 WebView 的 File System Access
+# API —— 后者在 WebView2 中会弹浏览器式权限提示且拿不到绝对路径）。
+tauri-plugin-dialog = "2"
 
 [features]
 default = ["custom-protocol"]

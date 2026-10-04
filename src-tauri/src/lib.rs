@@ -1588,6 +1588,7 @@ async fn shell_open_capabilities() -> Result<Value, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(RpcProcess::new()).manage(workspace::WorkspaceState::default())
         .setup(|app| {
             // 托盘图标 + 菜单（打开 / 退出）。失败不阻塞启动——托盘是
