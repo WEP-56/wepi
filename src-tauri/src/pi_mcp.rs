@@ -533,7 +533,8 @@ fn probe_http(url: &str) -> Result<String, String> {
     if !valid_scheme {
         return Err("URL 必须是 http(s)".to_owned());
     }
-    let output = Command::new("curl")
+    let mut probe = Command::new("curl");
+    probe
         .args([
             "-s",
             "-o",
@@ -545,7 +546,10 @@ fn probe_http(url: &str) -> Result<String, String> {
             "--location",
             trimmed,
         ])
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    #[cfg(windows)]
+    crate::no_window(&mut probe);
+    let output = probe
         .output()
         .map_err(|e| format!("curl 启动失败：{e}（请确认已安装 curl）"))?;
     let status = String::from_utf8_lossy(&output.stdout).trim().to_owned();

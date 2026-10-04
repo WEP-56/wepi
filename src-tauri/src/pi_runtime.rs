@@ -124,15 +124,18 @@ fn probe_version(executable: &str) -> Result<String, String> {
     let path = PathBuf::from(trimmed);
     let output = if cfg!(windows) && !trimmed.to_ascii_lowercase().ends_with(".exe") {
         // .cmd 垫片必须经 cmd.exe；raw_arg 避免二次转义。
-        Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()))
-            .raw_arg(format!("/D /S /C \"{}\" --version", trimmed.replace('"', "")))
-            .stdin(Stdio::null())
-            .output()
+        let mut command = Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
+        command.raw_arg(format!("/D /S /C \"{}\" --version", trimmed.replace('"', "")))
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        crate::no_window(&mut command);
+        command.output()
     } else {
-        Command::new(&path)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output()
+        let mut command = Command::new(&path);
+        command.arg("--version").stdin(Stdio::null());
+        #[cfg(windows)]
+        crate::no_window(&mut command);
+        command.output()
     }
     .map_err(|e| format!("无法启动：{e}"))?;
     if !output.status.success() {
@@ -322,15 +325,18 @@ pub fn update_pi() -> Result<Value, String> {
         for arg in &args {
             line.push_str(&format!(" {arg}"));
         }
-        Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()))
-            .raw_arg(line)
-            .stdin(Stdio::null())
-            .output()
+        let mut command = Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
+        command.raw_arg(line)
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        crate::no_window(&mut command);
+        command.output()
     } else {
-        Command::new(&executable)
-            .args(&args)
-            .stdin(Stdio::null())
-            .output()
+        let mut command = Command::new(&executable);
+        command.args(&args).stdin(Stdio::null());
+        #[cfg(windows)]
+        crate::no_window(&mut command);
+        command.output()
     }
     .map_err(|e| format!("无法启动更新：{e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

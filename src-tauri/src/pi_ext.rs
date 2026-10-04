@@ -125,6 +125,8 @@ fn run_pi(args: &[&str], online: bool) -> Result<String, String> {
         for (key, value) in env_extra {
             command.env(key, value);
         }
+        #[cfg(windows)]
+        crate::no_window(&mut command);
         command.output()
     } else {
         let mut command = Command::new(&executable);
@@ -132,6 +134,8 @@ fn run_pi(args: &[&str], online: bool) -> Result<String, String> {
         for (key, value) in env_extra {
             command.env(key, value);
         }
+        #[cfg(windows)]
+        crate::no_window(&mut command);
         command.output()
     }
     .map_err(|e| format!("无法启动 pi：{e}"))?;

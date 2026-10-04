@@ -84,21 +84,17 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             }
         });
     // 托盘图标不再由 tauri.conf.json 声明（配置声明会额外创建一个无菜单
-    // 的托盘实例，与这里的实例叠加成「双托盘」）。图标统一在此显式设置：
-    // 先试打包资源路径，dev 模式退回源码目录。
+    // 的托盘实例，与这里的实例叠加成「双托盘」）。图标来源优先级：
+    // 1) app.default_window_icon() —— bundle.icon 编译进二进制的图标，
+    //    NSIS 安装 / portable 解压后始终可用（release 里 Resource 路径
+    //    下的 icons/ 目录并不存在，读文件会拿到空图标）。
+    // 2) dev 模式退回源码目录 src-tauri/icons/icon.png。
     let mut icon_loaded = false;
-    if let Ok(resource) = app.path().resolve("icons/icon.png", tauri::path::BaseDirectory::Resource) {
-        if resource.is_file() {
-            if let Ok(bytes) = std::fs::read(&resource) {
-                if let Ok(decoded) = tauri::image::Image::from_bytes(&bytes) {
-                    tray = tray.icon(decoded);
-                    icon_loaded = true;
-                }
-            }
-        }
+    if let Some(embedded) = app.default_window_icon() {
+        tray = tray.icon(embedded.clone());
+        icon_loaded = true;
     }
     if !icon_loaded {
-        // dev 模式：resource 目录不存在，直接读 src-tauri/icons/icon.png。
         let fallback = std::env::current_dir()
             .map(|dir| dir.join("icons/icon.png"))
             .ok();

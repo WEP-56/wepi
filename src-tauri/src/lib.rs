@@ -22,6 +22,19 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+/// Windows：子进程不创建控制台窗口。
+///
+/// release 构建（windows subsystem，无控制台）下 spawn 任何控制台程序
+/// （cmd.exe / node / .cmd 垫片）都会新开一个终端窗口——表现为桌面应用
+/// 运行时弹出标题为 "pi" 的黑窗。`CREATE_NO_WINDOW` 让子进程保持无窗，
+/// stdio 管道不受影响。
+#[cfg(windows)]
+pub fn no_window(command: &mut std::process::Command) {
+    // CREATE_NO_WINDOW = 0x0800_0000
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
 /// 单个会话的 RPC 进程。`ready` 是该进程独有的就绪标志——
 /// 多个会话并行运行时，A 的输出不能把 B 标记为就绪。
 struct RpcSlot {
@@ -592,6 +605,8 @@ fn build_pi_command(executable: &str, session_path: Option<&str>) -> Result<Comm
         let launcher = Path::new(&program).with_file_name("pi-launcher.js");
         let mut launcher_command = Command::new(node);
         launcher_command.arg(launcher.as_os_str()).args(&args);
+        #[cfg(windows)]
+        no_window(&mut launcher_command);
         launcher_command
     } else if cfg!(windows) && !program.to_ascii_lowercase().ends_with(".exe") {
         let mut command = Command::new("cmd.exe");
@@ -610,10 +625,14 @@ fn build_pi_command(executable: &str, session_path: Option<&str>) -> Result<Comm
             }
         }
         command.raw_arg(line);
+        #[cfg(windows)]
+        no_window(&mut command);
         command
     } else {
         let mut command = Command::new(program);
         command.args(&args);
+        #[cfg(windows)]
+        no_window(&mut command);
         command
     };
     Ok(command)

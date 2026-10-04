@@ -492,7 +492,7 @@ export default function Settings({
                 <div className="mt-1.5 text-[13px] text-[var(--text-2)]">开源 AI Agent 桌面工作台</div>
                 <div className="mt-3 flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-card)] px-3 py-1 text-[12px] text-[var(--text-2)]">
                   <span className="size-1.5 rounded-full bg-[#3fb950]" />
-                  v0.1.0
+                  v0.1.1
                 </div>
               </div>
 
@@ -516,7 +516,7 @@ export default function Settings({
 
               <Section title="应用信息">
                 <Row title="版本" desc="语义化版本，随发布递增">
-                  <span className="font-mono text-[12.5px] text-[var(--text-2)]">0.1.0</span>
+                  <span className="font-mono text-[12.5px] text-[var(--text-2)]">0.1.1</span>
                 </Row>
                 <Row title="构建方式" desc="Rust 后端 + 单文件前端产物">
                   <span className="font-mono text-[12.5px] text-[var(--text-2)]">Vite · singlefile</span>

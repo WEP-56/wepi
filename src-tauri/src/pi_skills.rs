@@ -466,9 +466,13 @@ pub fn store_install(slug: &str) -> Result<Value, String> {
         ("npx".into(), build_unix_args(pkg, skill_name))
     };
     let _ = cmdline;
-    let output = std::process::Command::new(&program)
+    let mut command = std::process::Command::new(&program);
+    command
         .args(&args)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    crate::no_window(&mut command);
+    let output = command
         .output()
         .map_err(|e| format!("启动安装失败：{e}（请确认已安装 Node.js / npx）"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

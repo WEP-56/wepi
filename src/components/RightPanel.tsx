@@ -766,6 +766,11 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const id = `browser-${tab.id}`;
+  // 回调用 ref 转发：避免 onUrl 身份变化重跑创建 effect（父组件传的是
+  // 内联箭头函数，每次渲染都是新引用——effect 若依赖它，会在父级每次
+  // 重渲染时 close 再 create 原生 webview，表现为页面不断闪烁）。
+  const onUrlRef = useRef(onUrl);
+  useEffect(() => { onUrlRef.current = onUrl; });
 
   const navigate = async () => {
     let value = url.trim();
@@ -774,7 +779,7 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
       const parsed = new URL(value);
       if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('仅支持 HTTP 和 HTTPS 网页');
       setUrl(value);
-      onUrl(value);
+      onUrlRef.current(value);
       setLoading(true);
       if (isDesktopRuntime()) await invoke('browser_control', { id, action: 'navigate', args: { url: value } });
     } catch (cause) {
@@ -798,13 +803,17 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
     });
   }, [id]);
 
+  // 创建/销毁原生 webview 只应发生一次（挂载与卸载）。tab.url 的后续变化
+  // 由 navigate / on_page_load 事件处理，绝不因 url 状态翻转而重建——
+  // 重建 = 销毁再创建 = 页面重新加载 = 用户看到的闪烁。
+  const initialUrl = useRef(tab.url ?? '');
   useEffect(() => {
-    if (!isDesktopRuntime() || !tab.url || !content.current) return;
+    if (!isDesktopRuntime() || !initialUrl.current || !content.current) return;
     const rect = content.current.getBoundingClientRect();
     void invoke('browser_control', {
       id,
       action: 'create',
-      args: { url: tab.url, x: rect.left, y: rect.top, width: Math.max(1.0, rect.width - WEBVIEW_GUTTER), height: rect.height },
+      args: { url: initialUrl.current, x: rect.left, y: rect.top, width: Math.max(1.0, rect.width - WEBVIEW_GUTTER), height: rect.height },
     }).catch(() => {});
     const observer = new ResizeObserver(bounds);
     observer.observe(content.current);
@@ -815,7 +824,7 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
       if (event.payload.id !== id) return;
       if (typeof event.payload.url === 'string' && event.payload.url) {
         setUrl(event.payload.url);
-        onUrl(event.payload.url);
+        onUrlRef.current(event.payload.url);
       }
       setLoading(event.payload.loading === true);
     }).then((unlisten) => { stopEvents = unlisten; });
@@ -825,7 +834,9 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
       stopEvents?.();
       void invoke('browser_control', { id, action: 'close', args: {} }).catch(() => {});
     };
-  }, [id, tab.url, bounds, onUrl]);
+    // 依赖仅 id + bounds（bounds 由 id 派生，稳定）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, bounds]);
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
