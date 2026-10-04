@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { memo, type ReactNode } from 'react';
 
 function inline(text: string, keyBase: string): ReactNode[] {
   const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
@@ -20,7 +20,7 @@ function inline(text: string, keyBase: string): ReactNode[] {
   });
 }
 
-export default function Markdown({ text, caret }: { text: string; caret?: boolean }) {
+function Markdown({ text, caret }: { text: string; caret?: boolean }) {
   const lines = text.split('\n');
   const blocks: ReactNode[] = [];
   let list: string[] = [];
@@ -47,3 +47,6 @@ export default function Markdown({ text, caret }: { text: string; caret?: boolea
   flush(lines.length);
   return <div className={'text-[14px] leading-[24px] text-[var(--text)] ' + (caret ? 'caret' : '')}>{blocks}</div>;
 }
+
+// 流式期间父组件每个批次都会重渲染，未变动的消息靠 memo 跳过整段 Markdown 解析。
+export default memo(Markdown);

@@ -36,15 +36,15 @@ import {
   ensurePiSession,
   isDesktopRuntime,
   listenPiRpc,
-  promptRecord,
   readPiConfig,
+  readPiSession,
   requestPiRpc,
   scanPiSessions,
   sendPiRpc,
   stopPiRpc,
   writePiConfig,
 } from './lib/piRpc';
-import { cwdFromSessionPath, projectPiEntries, titleFromIndexEntry, type PiEntry } from './lib/piSession';
+import { projectPiEntries, titleFromIndexEntry, type PiEntry } from './lib/piSession';
 import type { UsageSnapshot } from './components/ContextUsage';
 import type { StepDetail } from './data';
 import {
@@ -109,24 +109,18 @@ function loadStore(): PersistedStore {
 function usePersistedStore() {
   const [store, setStore] = useState<PersistedStore>(loadStore);
   const saveTimer = useRef<number>(0);
+  const mutate = useCallback((updater: (prev: PersistedStore) => PersistedStore) => {
+    setStore((s) => updater(s));
+  }, []);
   const setProjects = useCallback((updater: Project[] | ((prev: Project[]) => Project[])) => {
-    setStore((s) => {
-      const projects = typeof updater === 'function' ? updater(s.projects) : updater;
-      return { ...s, projects };
-    });
-  }, []);
+    mutate((s) => ({ ...s, projects: typeof updater === 'function' ? updater(s.projects) : updater }));
+  }, [mutate]);
   const setThreads = useCallback((updater: Thread[] | ((prev: Thread[]) => Thread[])) => {
-    setStore((s) => {
-      const threads = typeof updater === 'function' ? updater(s.threads) : updater;
-      return { ...s, threads };
-    });
-  }, []);
+    mutate((s) => ({ ...s, threads: typeof updater === 'function' ? updater(s.threads) : updater }));
+  }, [mutate]);
   const setExpanded = useCallback((updater: string[] | ((prev: string[]) => string[])) => {
-    setStore((s) => {
-      const expanded = typeof updater === 'function' ? updater(s.expanded) : updater;
-      return { ...s, expanded };
-    });
-  }, []);
+    mutate((s) => ({ ...s, expanded: typeof updater === 'function' ? updater(s.expanded) : updater }));
+  }, [mutate]);
   // 防抖持久化：会话内容高频更新（流式 delta）时不逐次写盘。
   const persist = useCallback((next: PersistedStore) => {
     window.clearTimeout(saveTimer.current);
@@ -137,13 +131,13 @@ function usePersistedStore() {
     }, 400);
   }, []);
   useEffect(() => { persist(store); }, [store, persist]);
-  return { store, setProjects, setThreads, setExpanded };
+  return { store, mutate, setProjects, setThreads, setExpanded };
 }
 
 export default function App() {
   const [themePref, setThemePref] = useState<ThemePref>(() => (localStorage.getItem('theme') as ThemePref) || 'dark');
   const [sysDark, setSysDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
-  const { store, setProjects, setThreads, setExpanded } = usePersistedStore();
+  const { store, mutate, setProjects, setThreads, setExpanded } = usePersistedStore();
   const projects = store.projects;
   const threads = store.threads;
   const expanded = store.expanded;
@@ -189,10 +183,9 @@ export default function App() {
   const navRef = useRef(nav);
   navRef.current = nav;
   const lastHome = useRef<string | null>(null);
-  const piRun = useRef<{ threadId: string; messageId: string; startedAt: number; rpcKey: string } | null>(null);
+  /** 正在进行的回合：按 RPC 会话键索引，支持多会话并行运行 */
+  const piRuns = useRef(new Map<string, { threadId: string; messageId: string; startedAt: number; rpcKey: string; segmentStart: number; contentLen: number }>());
   const piModelsConfig = useRef<Record<string, Record<string, unknown>>>({});
-  /** 已合并进 threads 的 Pi 会话文件集合（防止重复导入） */
-  const importedSessions = useRef<Set<string>>(new Set());
   /** 会话打开请求的代际号，防止旧请求覆盖新导航 */
   const openGeneration = useRef(0);
 
@@ -209,11 +202,6 @@ export default function App() {
     void readPiConfig().then((snapshot) => {
       if (!snapshot) return;
       setPiRuntimeInfo({ agentDir: snapshot.agentDir, piPath: snapshot.piPath, skillsCount: snapshot.skillsCount, extensionsCount: snapshot.extensionsCount });
-      if (snapshot.cwd && projects.length === 0) {
-        const normalized = snapshot.cwd.replace(/[\\/]+$/, '');
-        const name = normalized.split(/[\\/]/).pop() || normalized;
-        setProjects([{ id: `workspace:${normalized}`, name, path: normalized, branch: 'main' }]);
-      }
       const entries = Object.entries(snapshot.models.providers ?? {});
       piModelsConfig.current = Object.fromEntries(entries.map(([id, value]) => [id, value as unknown as Record<string, unknown>]));
       const nextProviders: Provider[] = entries.map(([id, value]) => {
@@ -249,49 +237,69 @@ export default function App() {
     });
   }, []);
 
-  /* ---------- Pi 会话索引合并：让侧边栏与 Pi CLI 共享会话列表 ---------- */
+  /* ---------- Pi 会话索引合并：会话按 cwd 归入对应工作区项目 ---------- */
   useEffect(() => {
     if (!isDesktopRuntime()) return;
     let cancelled = false;
+    const normalizePath = (value: string) => value.replace(/[\\/]+$/, '').toLowerCase();
+    const baseName = (value: string) => value.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || value;
     const merge = () => {
       void scanPiSessions().then((sessions) => {
-        if (cancelled) return;
-        setThreads((prev) => {
-          const next = [...prev];
+        if (cancelled || sessions.length === 0) return;
+        mutate((prev) => {
+          const projects = [...prev.projects];
+          const byPath = new Map(projects.map((p) => [normalizePath(p.path), p]));
+          const threads = [...prev.threads];
           let changed = false;
           for (const entry of sessions) {
-            const existing = next.find((t) => t.piSessionPath === entry.sessionPath);
-            if (existing) {
-              // 已导入：更新元数据（大小变化提示有新消息）
-              if (existing.piFileSize !== undefined && existing.piFileSize !== entry.fileSize && !existing.messages.some((m) => m.streaming || m.thinking)) {
-                const idx = next.indexOf(existing);
-                next[idx] = { ...existing, unread: true };
+            // Pi 会话天然绑定工作区（cwd）——为其建立/复用对应项目，
+            // 使侧边栏呈现「项目 › 会话」的结构，而不是全部堆在「最近」。
+            // cwd 只取会话文件首行的权威值；目录名解码是有损的，不作为来源。
+            const cwd = entry.cwd ?? null;
+            let projectId: string | null = null;
+            if (cwd) {
+              const key = normalizePath(cwd);
+              let project = byPath.get(key);
+              if (!project) {
+                project = { id: `workspace:${key}`, name: baseName(cwd), path: cwd, branch: '' };
+                projects.push(project);
+                byPath.set(key, project);
                 changed = true;
               }
+              projectId = project.id;
+            }
+            const index = threads.findIndex((t) => t.piSessionPath === entry.sessionPath);
+            if (index === -1) {
+              threads.push({
+                id: `pisession:${entry.sessionId ?? entry.sessionPath}`,
+                title: titleFromIndexEntry(entry),
+                projectId,
+                messages: [],
+                piSessionPath: entry.sessionPath,
+                piCwd: cwd,
+                piFileSize: entry.fileSize,
+              });
+              changed = true;
               continue;
             }
-            const cwd = cwdFromSessionPath(entry.sessionPath) ?? entry.cwd ?? null;
-            const thread: Thread = {
-              id: `pisession:${entry.sessionId ?? entry.sessionPath}`,
-              title: titleFromIndexEntry(entry),
-              projectId: null,
-              messages: [],
-              piSessionPath: entry.sessionPath,
-              piCwd: cwd,
-              piFileSize: entry.fileSize,
-            };
-            importedSessions.current.add(entry.sessionPath);
-            next.push(thread);
-            changed = true;
+            const existing = threads[index];
+            const busy = existing.messages.some((m) => m.streaming || m.thinking);
+            if (existing.projectId !== projectId) {
+              threads[index] = { ...existing, projectId, piCwd: cwd };
+              changed = true;
+            } else if (!busy && existing.piFileSize !== undefined && existing.piFileSize !== entry.fileSize) {
+              threads[index] = { ...existing, unread: true };
+              changed = true;
+            }
           }
-          return changed ? next : prev;
+          return changed ? { ...prev, projects, threads } : prev;
         });
       }).catch(() => { /* sessions 目录不可用时静默 */ });
     };
     merge();
     const interval = window.setInterval(merge, 15_000);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, [setThreads]);
+  }, [mutate]);
   useEffect(() => {
     if (!isDesktopRuntime() || !piConfigReady) return;
     const models = {
@@ -418,31 +426,30 @@ export default function App() {
   const patchThread = (id: string, p: Partial<Thread>) => setThreads((ts) => ts.map((t) => (t.id === id ? { ...t, ...p } : t)));
 
   /**
-   * 打开 Pi 会话：懒加载历史。
-   * 若 thread 绑定了 piSessionPath 且尚无消息，启动 `pi --mode rpc --session <path>`
-   * （cwd 必须与会话存储目录一致），通过 get_entries 拉取完整历史并投影成消息。
+   * 打开会话：Pi 历史会话走**直接读 JSONL**（不启动任何进程）。
+   * 之前为读历史而 `pi --mode rpc --session` 拉起 Node 进程，是点一下
+   * 会话就卡顿数秒的根因；只有真正发消息时才会启动进程。
    */
   const openThread = (id: string) => {
     patchThread(id, { unread: false });
     go({ view: 'home', threadId: id });
     const thread = threads.find((t) => t.id === id);
     if (!isDesktopRuntime() || !thread?.piSessionPath) return;
-    if (thread.messages.length > 0) return; // 已有本地消息（新会话或已加载）
+    const busy = thread.messages.some((m) => m.streaming || m.thinking);
+    if (busy) return;
     const generation = ++openGeneration.current;
-    const rpcKey = thread.rpcKey ?? `rpc-${id}`;
-    void (async () => {
-      await ensurePiSession({ sessionKey: rpcKey, cwd: thread.piCwd, sessionPath: thread.piSessionPath });
+    void readPiSession(thread.piSessionPath).then((entries) => {
       if (openGeneration.current !== generation) return;
-      const result = await requestPiRpc<{ entries?: PiEntry[] }>({ type: 'get_entries' }, 15_000, rpcKey);
-      if (openGeneration.current !== generation) return;
-      const messages = projectPiEntries(result.entries ?? []);
-      setThreads((ts) => ts.map((t) => (t.id === id && t.messages.length === 0 ? { ...t, messages, rpcKey } : t)));
-    })().catch((error: unknown) => {
+      const messages = projectPiEntries(entries as unknown as PiEntry[]);
+      setThreads((ts) => ts.map((t) => (t.id === id && !t.messages.some((m) => m.streaming || m.thinking)
+        ? { ...t, messages, piFileSize: undefined }
+        : t)));
+    }).catch((error: unknown) => {
       if (openGeneration.current !== generation) return;
       const message = error instanceof Error ? error.message : String(error);
       setThreads((ts) => ts.map((t) => (t.id === id && t.messages.length === 0 ? {
         ...t,
-        messages: [{ id: uid(), role: 'assistant', content: `加载 Pi 会话历史失败：${message}\n\n会话文件：${thread.piSessionPath}` }],
+        messages: [{ id: uid(), role: 'assistant', content: `读取 Pi 会话文件失败：${message}\n\n${thread.piSessionPath}` }],
       } : t)));
     });
   };
@@ -685,16 +692,21 @@ export default function App() {
   /* ---------- Pi RPC 事件 → 聊天区域渲染状态机 ---------- */
   useEffect(() => {
     let dispose: (() => void) | undefined;
-    void listenPiRpc({
+    dispose = listenPiRpc({
       event: (record) => {
-        const run = piRun.current;
+        // 按来源会话键路由：允许多个会话同时运行（切走再发消息不会串台）。
+        const sessionKey = typeof record.__sessionKey === 'string' ? record.__sessionKey : undefined;
+        const run = sessionKey ? piRuns.current.get(sessionKey) : undefined;
         if (!run) return;
         const event = record.type;
         const assistantEvent = (record.assistantMessageEvent ?? {}) as Record<string, unknown>;
         const textFromContent = (value: unknown) => Array.isArray(value)
           ? value.filter((block): block is Record<string, unknown> => !!block && typeof block === 'object' && block.type === 'text').map((block) => typeof block.text === 'string' ? block.text : '').join('')
           : typeof value === 'string' ? value : '';
-        const appendText = (delta: string) => updateMsg(run.threadId, run.messageId, (message) => ({ thinking: false, streaming: true, content: message.content + delta }));
+        const appendText = (delta: string) => updateMsg(run.threadId, run.messageId, (message) => {
+          run.contentLen = message.content.length + delta.length;
+          return { thinking: false, streaming: true, content: message.content + delta };
+        });
         const appendThinking = (delta: string) => updateMsg(run.threadId, run.messageId, (message) => ({ thinking: true, streaming: true, thinkingContent: (message.thinkingContent ?? '') + delta }));
 
         if (event === 'assistant_text_delta') {
@@ -706,8 +718,12 @@ export default function App() {
         } else if (event === 'assistant_thinking_end') {
           updateMsg(run.threadId, run.messageId, () => ({ thinking: false, streaming: true }));
         } else if (event === 'assistant_message_start') {
-          // Pi 开始新一轮 assistant 消息：流式期间正常渲染 thinking 占位。
-          updateMsg(run.threadId, run.messageId, (message) => ({ thinking: true, streaming: true, content: message.content, thinkingContent: message.thinkingContent }));
+          // 记录本段起点：一个回合可能包含多条 assistant 消息（工具循环）。
+          updateMsg(run.threadId, run.messageId, (message) => {
+            run.segmentStart = message.content.length;
+            run.contentLen = message.content.length;
+            return { thinking: true, streaming: true };
+          });
         } else if (event === 'user_message_start') {
           // Pi may echo the accepted user message; the local optimistic message is authoritative.
         } else if (event === 'message_update') {
@@ -720,15 +736,18 @@ export default function App() {
           } else if (assistantEvent.type === 'thinking_end') {
             updateMsg(run.threadId, run.messageId, () => ({ thinking: false, streaming: true }));
           }
-        } else if (event === 'assistant_message_end') {
-          // 消息级结束：用 Pi 落盘的最终内容补全（流式可能丢块）。
+        } else if (event === 'assistant_message_end' || (event === 'message_end' && (record.message as Record<string, unknown> | undefined)?.role === 'assistant')) {
+          // 段落级校正：用 Pi 落盘的该段最终文本替换本段流式累积结果，
+          // 既补回丢块，也不会把上一段内容重复一遍。
           const finalText = textFromContent((record.message as Record<string, unknown> | undefined)?.content);
-          if (finalText) updateMsg(run.threadId, run.messageId, (message) => ({ thinking: false, streaming: true, content: message.content + finalText.slice(message.content.length) }));
-        } else if (event === 'message_end') {
-          const message = record.message as Record<string, unknown> | undefined;
-          if (message?.role === 'assistant') {
-            const content = textFromContent(message.content);
-            if (content) updateMsg(run.threadId, run.messageId, (current) => ({ content, thinking: false, streaming: true, thinkingContent: current.thinkingContent }));
+          if (finalText) {
+            updateMsg(run.threadId, run.messageId, (message) => {
+              const head = message.content.slice(0, run.segmentStart);
+              run.contentLen = head.length + finalText.length;
+              return { content: head + finalText, thinking: false, streaming: true };
+            });
+          } else {
+            updateMsg(run.threadId, run.messageId, () => ({ thinking: false, streaming: true }));
           }
         } else if (event === 'tool_execution_start') {
           const toolName = typeof record.toolName === 'string' ? record.toolName : '工具';
@@ -768,42 +787,40 @@ export default function App() {
           if (message?.success === false && String(message.id ?? '').startsWith('wepi-')) {
             updateMsg(run.threadId, run.messageId, () => ({ thinking: false, streaming: false, content: `Pi RPC 请求失败：${String(message.error ?? '未知错误')}` }));
           }
-        } else if (event === 'agent_settled' || event === 'agent_end') {
-          // agent_end 兼容旧事件名；settled 表示回合彻底完成。
-          const finish = () => {
-            updateMsg(run.threadId, run.messageId, (message) => ({
-              thinking: false,
-              streaming: false,
-              duration: Math.max(1, Math.round((Date.now() - run.startedAt) / 1000)),
-              content: message.content || '（Pi 未返回文本）',
-            }));
-            if (navRef.current.threadId !== run.threadId || navRef.current.view !== 'home')
-              setThreads((ts) => ts.map((thread) => thread.id === run.threadId ? { ...thread, unread: true } : thread));
-            piRun.current = null;
-            void requestPiRpc<{ sessionFile?: string; contextUsage?: { tokens?: number | null; contextWindow?: number; percent?: number | null }; tokens?: { input?: number; output?: number; cacheRead?: number }; cost?: number }>({ type: 'get_session_stats' }, 10_000, run.rpcKey).then((stats) => {
-              const context = stats.contextUsage ?? {};
-              const tokens = stats.tokens ?? {};
-              setUsage({ contextPercent: context.percent ?? 0, contextTokens: context.tokens ?? 0, contextWindow: context.contextWindow ?? 0, inputTokens: tokens.input ?? 0, outputTokens: tokens.output ?? 0, cacheReadTokens: tokens.cacheRead ?? 0, totalCost: stats.cost ?? 0 });
-              if (stats.sessionFile) {
-                setThreads((ts) => ts.map((thread) => thread.id === run.threadId && !thread.piSessionPath ? { ...thread, piSessionPath: stats.sessionFile } : thread));
-              }
-            }).catch(() => {});
-          };
-          finish();
+        } else if (event === 'agent_settled') {
+          // 只有 agent_settled 代表回合彻底结束；agent_end 仅是元数据（pilo 同此约定），
+          // 若在 agent_end 就收尾会把尾部文本截断。
+          updateMsg(run.threadId, run.messageId, (message) => ({
+            thinking: false,
+            streaming: false,
+            duration: Math.max(1, Math.round((Date.now() - run.startedAt) / 1000)),
+            content: message.content || '（Pi 未返回文本）',
+          }));
+          if (navRef.current.threadId !== run.threadId || navRef.current.view !== 'home')
+            setThreads((ts) => ts.map((thread) => thread.id === run.threadId ? { ...thread, unread: true } : thread));
+          piRuns.current.delete(run.rpcKey);
+          void requestPiRpc<{ sessionFile?: string; contextUsage?: { tokens?: number | null; contextWindow?: number; percent?: number | null }; tokens?: { input?: number; output?: number; cacheRead?: number }; cost?: number }>({ type: 'get_session_stats' }, 10_000, run.rpcKey).then((stats) => {
+            const context = stats.contextUsage ?? {};
+            const tokens = stats.tokens ?? {};
+            setUsage({ contextPercent: context.percent ?? 0, contextTokens: context.tokens ?? 0, contextWindow: context.contextWindow ?? 0, inputTokens: tokens.input ?? 0, outputTokens: tokens.output ?? 0, cacheReadTokens: tokens.cacheRead ?? 0, totalCost: stats.cost ?? 0 });
+            if (stats.sessionFile) {
+              setThreads((ts) => ts.map((thread) => (thread.id === run.threadId && !thread.piSessionPath ? { ...thread, piSessionPath: stats.sessionFile } : thread)));
+            }
+          }).catch(() => {});
         }
       },
       error: (message) => showToast(message),
       exit: (sessionKey) => {
-        const run = piRun.current;
-        if (!run || (sessionKey && run.rpcKey !== sessionKey)) return;
-        piRun.current = null;
+        const run = sessionKey ? piRuns.current.get(sessionKey) : undefined;
+        if (!run) return;
+        piRuns.current.delete(run.rpcKey);
         updateMsg(run.threadId, run.messageId, (message) => ({
           thinking: false,
           streaming: false,
           content: message.content || 'Pi RPC 进程已退出，请检查 Pi 配置和错误日志。',
         }));
       },
-    }).then((unlisten) => { dispose = unlisten; });
+    });
     return () => { dispose?.(); void stopPiRpc(); };
   }, [showToast]);
 
@@ -812,6 +829,8 @@ export default function App() {
     const userMsg: Message = { id: uid(), role: 'user', content: text };
     const aid = uid();
     const thinking: Message = { id: aid, role: 'assistant', content: '', thinking: true };
+    // 新会话的工作目录取自所选项目——Pi 会话按 cwd 归档，必须一开始就绑定。
+    const newThreadCwd = projects.find((p) => p.id === selectedProject)?.path ?? null;
     if (!tid) {
       tid = uid();
       const t: Thread = {
@@ -819,6 +838,7 @@ export default function App() {
         title: text.split('\n')[0].slice(0, 24),
         projectId: selectedProject,
         messages: [userMsg, thinking],
+        piCwd: newThreadCwd,
       };
       setThreads((ts) => [t, ...ts]);
       expand(selectedProject);
@@ -841,26 +861,44 @@ export default function App() {
       void (async () => {
         // 每个会话独立 RPC 进程；绑定相同 cwd+session 时复用。
         await ensurePiSession({ sessionKey: rpcKey, cwd: workingDirectory, sessionPath });
-        setThreads((ts) => ts.map((t) => (t.id === rpcThreadId ? { ...t, rpcKey } : t)));
-        piRun.current = { threadId: rpcThreadId, messageId: aid, startedAt: runStartedAt, rpcKey };
-        await refreshPiCatalog(rpcKey);
-        const [provider, ...modelParts] = composer.model.split(':');
-        const modelId = modelParts.join(':');
-        try {
-          if (provider && modelId) await requestPiRpc({ type: 'set_model', provider, modelId }, 10_000, rpcKey);
-          const thinking = await requestPiRpc<{ levels?: string[]; thinkingLevels?: string[] }>({ type: 'get_available_thinking_levels' }, 10_000, rpcKey);
-          const levels = (thinking.levels ?? thinking.thinkingLevels ?? []).filter((level): level is (typeof efforts)[number] => (efforts as readonly string[]).includes(level));
-          if (levels.length) setPiEfforts(levels);
-          await requestPiRpc({ type: 'set_thinking_level', level: composer.effort }, 10_000, rpcKey);
-        } catch {
-          // Keep compatibility with older Pi builds that lack one of these RPCs.
+        mutate((prev) => ({
+          ...prev,
+          threads: prev.threads.map((t) => (t.id === rpcThreadId ? { ...t, rpcKey, piCwd: t.piCwd ?? workingDirectory } : t)),
+        }));
+        piRuns.current.set(rpcKey, { threadId: rpcThreadId, messageId: aid, startedAt: runStartedAt, rpcKey, segmentStart: 0, contentLen: 0 });
+        // 模型与思考档位由 Pi 持有。仅当本地选择确实存在于 Pi 的可用目录中时才下发，
+        // 否则沿用 Pi 自己的配置——避免陈旧/拼错的模型导致 "Model not found"。
+        const catalog = await requestPiRpc<{ models?: { id: string; name?: string; provider: string }[] }>(
+          { type: 'get_available_models' }, 10_000, rpcKey,
+        ).catch(() => null);
+        const models = catalog?.models ?? [];
+        if (models.length) {
+          setPiModels(models.map((m) => ({ id: m.id, name: m.name ?? m.id, provider: m.provider })));
         }
-        await sendPiRpc(promptRecord(uid(), text), rpcKey);
+        try {
+          const [provider, ...modelParts] = composer.model.split(':');
+          const modelId = modelParts.join(':');
+          if (provider && modelId && models.some((m) => m.provider === provider && m.id === modelId)) {
+            await requestPiRpc({ type: 'set_model', provider, modelId }, 10_000, rpcKey);
+          }
+          const levels = await requestPiRpc<{ levels?: string[]; thinkingLevels?: string[] }>({ type: 'get_available_thinking_levels' }, 10_000, rpcKey);
+          const supported = (levels.levels ?? levels.thinkingLevels ?? []).filter((level): level is (typeof efforts)[number] => (efforts as readonly string[]).includes(level));
+          if (supported.length) {
+            setPiEfforts(supported);
+            await requestPiRpc({ type: 'set_thinking_level', level: supported.includes(composer.effort) ? composer.effort : supported[0] }, 10_000, rpcKey);
+          }
+        } catch {
+          // 旧版 Pi 可能缺少其中某个命令，不影响本轮对话。
+        }
+        // prompt 用 request 发送：Pi 接受后即返回，被拒绝时错误能落到调用方，
+        // 而不是混进助手正文。
+        await requestPiRpc({ type: 'prompt', message: text }, 30_000, rpcKey);
+        await refreshPiCatalog(rpcKey);
       })().catch((error: unknown) => {
-        piRun.current = null;
+        piRuns.current.delete(rpcKey);
         const message = error instanceof Error ? error.message : 'Pi RPC 启动失败';
         showToast(message);
-        updateMsg(rpcThreadId, aid, () => ({ thinking: false, streaming: false, content: `Pi RPC 启动失败：${message}` }));
+        updateMsg(rpcThreadId, aid, () => ({ thinking: false, streaming: false, content: `发送失败：${message}` }));
       });
       return;
     }
@@ -904,10 +942,12 @@ export default function App() {
       clearInterval(x);
     });
     delete timers.current[id];
-    if (isDesktopRuntime() && piRun.current?.threadId === id) {
-      const run = piRun.current;
-      piRun.current = null;
-      void sendPiRpc({ type: 'abort' }, run.rpcKey).catch(() => {});
+    if (isDesktopRuntime()) {
+      const run = [...piRuns.current.values()].find((r) => r.threadId === id);
+      if (run) {
+        piRuns.current.delete(run.rpcKey);
+        void sendPiRpc({ type: 'abort' }, run.rpcKey).catch(() => {});
+      }
     }
     setThreads((ts) =>
       ts.map((t) =>

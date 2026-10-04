@@ -21,6 +21,9 @@ export interface PiEntry {
 export interface PiEntryMessage {
   role?: string;
   content?: unknown;
+  toolCallId?: string;
+  toolName?: string;
+  isError?: boolean;
   usage?: { input?: number; output?: number; totalTokens?: number };
   stopReason?: string;
   [key: string]: unknown;
@@ -36,11 +39,15 @@ const textOfContent = (value: unknown): string =>
       ? value
       : '';
 
+/** Pi 的 thinking block 把文本放在 `thinking` 字段（不是 `text`）。 */
 const thinkingOfContent = (value: unknown): string =>
   Array.isArray(value)
     ? value
         .filter((block): block is Record<string, unknown> => !!block && typeof block === 'object' && block.type === 'thinking')
-        .map((block) => (typeof block.text === 'string' ? block.text : ''))
+        .map((block) => {
+          if (typeof block.thinking === 'string') return block.thinking;
+          return typeof block.text === 'string' ? block.text : '';
+        })
         .join('')
     : '';
 
@@ -50,13 +57,18 @@ interface ToolBlock {
   args: Record<string, unknown>;
 }
 
+/** Pi 落盘的工具调用 block 形如 {type:"toolCall", id, name, arguments}。 */
 const toolCallsOfContent = (value: unknown): ToolBlock[] =>
   Array.isArray(value)
     ? value
-        .filter((block): block is Record<string, unknown> => !!block && typeof block === 'object' && block.type === 'toolcall')
+        .filter((block): block is Record<string, unknown> => {
+          if (!block || typeof block !== 'object') return false;
+          const type = block.type;
+          return type === 'toolCall' || type === 'toolcall' || type === 'tool_call';
+        })
         .map((block) => ({
           toolCallId: String(block.id ?? block.toolCallId ?? ''),
-          toolName: String(block.toolName ?? block.name ?? 'tool'),
+          toolName: String(block.name ?? block.toolName ?? 'tool'),
           args: (block.arguments ?? block.args ?? {}) as Record<string, unknown>,
         }))
         .filter((call) => call.toolCallId)
@@ -162,14 +174,16 @@ export function projectPiEntries(entries: PiEntry[]): Message[] {
     branch.push(...entries);
   }
 
-  // toolResult 记录以 toolCallId 关联。
+  // toolResult 消息：toolCallId 挂在 message 上（不在 content block 内）。
   const resultsById = new Map<string, { result: unknown; isError?: boolean }>();
   for (const entry of branch) {
     const message = entry.message;
     if (!message || message.role !== 'toolResult') continue;
-    const callId = Array.isArray(message.content)
-      ? (message.content.find((b): b is Record<string, unknown> => !!b && typeof b === 'object' && b.type === 'toolResult')?.toolCallId as string | undefined)
-      : undefined;
+    const callId = typeof message.toolCallId === 'string' && message.toolCallId
+      ? message.toolCallId
+      : Array.isArray(message.content)
+        ? (message.content.find((b): b is Record<string, unknown> => !!b && typeof b === 'object' && typeof b.toolCallId === 'string')?.toolCallId as string | undefined)
+        : undefined;
     if (callId) resultsById.set(callId, { result: message.content, isError: message.isError === true });
   }
 
@@ -182,14 +196,33 @@ export function projectPiEntries(entries: PiEntry[]): Message[] {
       if (text) messages.push({ id: nextId(), role: 'user', content: text });
     } else if (message.role === 'assistant') {
       const { content, thinking, steps, edits } = stepsFromAssistant(entry, resultsById);
-      messages.push({
-        id: nextId(),
-        role: 'assistant',
-        content,
-        thinkingContent: thinking || undefined,
-        steps: steps.length ? steps : undefined,
-        edits: edits?.length ? edits : undefined,
-      });
+      // 一个回合内 Pi 会写入多条 assistant 消息（每次工具调用一轮）。
+      // 与 pilo 的 ensure_assistant_start / PiDeck 的回合分组一致：
+      // 两条 user 消息之间的所有 assistant 内容合并为同一个气泡，
+      // 这样历史渲染与实时流式的观感才一致。
+      const previous = messages[messages.length - 1];
+      const canMerge = previous?.role === 'assistant';
+      const mergedText = canMerge && content
+        ? (previous.content ? `${previous.content}\n\n${content}` : content)
+        : content;
+      if (canMerge) {
+        messages[messages.length - 1] = {
+          ...previous,
+          content: mergedText,
+          thinkingContent: [previous.thinkingContent, thinking].filter(Boolean).join('\n\n') || undefined,
+          steps: [...(previous.steps ?? []), ...steps].length ? [...(previous.steps ?? []), ...steps] : undefined,
+          edits: [...(previous.edits ?? []), ...(edits ?? [])].length ? [...(previous.edits ?? []), ...(edits ?? [])] : undefined,
+        };
+      } else {
+        messages.push({
+          id: nextId(),
+          role: 'assistant',
+          content,
+          thinkingContent: thinking || undefined,
+          steps: steps.length ? steps : undefined,
+          edits: edits?.length ? edits : undefined,
+        });
+      }
     }
   }
   return messages;
@@ -206,18 +239,23 @@ export function titleFromIndexEntry(entry: PiSessionIndexEntry): string {
   return file.replace(/\.jsonl$/, '').replace(/^\d{4}-\d{2}-\d{2}T[\d-]+Z_/, '').slice(0, 24) || 'Pi 会话';
 }
 
-/** 索引条目 → 工作目录（sessions 目录名 --E--WEPI-- 反推为 E:\WEPI）。 */
+/**
+ * 从 sessions 目录名反推工作目录（`--E--Tlegado--` → `E:\Tlegado`）。
+ *
+ * 注意：该编码是**有损**的——`:` 与 `\` 都映射为 `-`，因此含连字符的目录名
+ * （如 `src-tauri`）无法可靠还原。仅作为 header 缺 `cwd` 时的兜底展示，
+ * 权威来源始终是会话文件首行的 `cwd` 字段。
+ */
 export function cwdFromSessionPath(sessionPath: string): string | null {
   const parent = sessionPath.split(/[\\/]/).slice(-2, -1)[0];
-  if (!parent || !/^--/.test(parent) || !parent.endsWith('-')) return null;
-  const body = parent.slice(2, -1);
+  if (!parent || !/^--/.test(parent) || !parent.endsWith('--')) return null;
+  const body = parent.slice(2, -2);
   if (!body) return null;
-  const isWindowsDrive = /^([A-Za-z])--/.test(body);
+  const isWindowsDrive = /^[A-Za-z]--/.test(body);
   if (isWindowsDrive) {
-    const drive = body[0];
-    return `${drive}:\\${body.slice(2).replace(/--/g, '\\')}`;
+    return `${body[0]}:\\${body.slice(3).replace(/-/g, '\\')}`;
   }
-  return `/${body.replace(/--/g, '/')}`;
+  return `/${body.replace(/-/g, '/')}`;
 }
 
 export { nextId as piRecordId };

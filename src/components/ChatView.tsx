@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import {
   Folder,
   MoreHorizontal,
@@ -65,25 +65,37 @@ function fallbackSteps(m: Message): Step[] {
   }));
 }
 
-function AssistantMsg({ m, onView, onToast }: { m: Message; onView: () => void; onToast: (s: string) => void }) {
+function AssistantMsgBase({ m, onView, onToast }: { m: Message; onView: () => void; onToast: (s: string) => void }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const steps = m.steps ?? fallbackSteps(m);
-  if (m.thinking)
-    return (
-      <div className="py-2 text-[14px]">
-        <span className="shimmer-text font-medium">正在思考…</span>
-        {m.thinkingContent && <div className="mt-2 whitespace-pre-wrap text-[13px] leading-5 text-[var(--text-3)]">{m.thinkingContent}</div>}
-      </div>
-    );
+  const hasSteps = steps.length > 0;
+  // 回合进行中：过程默认展开，让工具调用实时可见（PiDeck 的 process 分组同思路）。
+  const expanded = m.streaming ? true : open;
   return (
     <div className="group">
-      {m.duration !== undefined && !m.streaming && (
+      {hasSteps && (
         <>
-          <StepsDisclosure open={open} onToggle={() => setOpen((o) => !o)} duration={m.duration} steps={steps} />
-          {open && <StepList steps={steps} />}
-          <div className="my-3 h-px bg-[var(--border)]" />
+          <StepsDisclosure open={expanded} onToggle={() => setOpen((o) => !o)} duration={m.duration} steps={steps} running={m.streaming} />
+          {expanded && <StepList steps={steps} />}
+          {!m.streaming && <div className="my-3 h-px bg-[var(--border)]" />}
         </>
+      )}
+      {/* 思考是独立于正文的过程信息，折叠呈现；不再因为「正在思考」而隐藏已流出的正文。 */}
+      {(m.thinking || m.thinkingContent) && (
+        <div className="mb-2">
+          <div className={cn('text-[13px]', m.thinking && 'shimmer-text font-medium')}>{m.thinking ? '正在思考…' : '已思考'}</div>
+          {m.thinkingContent && (
+            <details className="mt-1" open={!!m.thinking}>
+              <summary className="cursor-default text-[12px] text-[var(--text-3)] hover:text-[var(--text-2)]">
+                {m.thinking ? '' : '查看思考过程'}
+              </summary>
+              <div className="mt-1.5 whitespace-pre-wrap border-l-2 border-[var(--border)] pl-2.5 text-[12.5px] leading-5 text-[var(--text-3)]">
+                {m.thinkingContent}
+              </div>
+            </details>
+          )}
+        </div>
       )}
       <Markdown text={m.content} caret={m.streaming} />
       {m.edits && !m.streaming && <EditCard edits={m.edits} onView={onView} onToast={onToast} />}
@@ -103,6 +115,13 @@ function AssistantMsg({ m, onView, onToast }: { m: Message; onView: () => void; 
     </div>
   );
 }
+
+/**
+ * 只按消息对象判断是否需要重渲染：流式期间 updateMsg 会为未变动的消息
+ * 保持对象标识，因此历史消息可以整段跳过 Markdown 解析与 DOM diff。
+ * 回调（onView/onToast）行为恒定，不参与比较。
+ */
+const AssistantMsg = memo(AssistantMsgBase, (prev, next) => prev.m === next.m);
 
 export function EmptyState({ project, rightOpen, onToggleRight }: { project: Project | null; rightOpen: boolean; onToggleRight: () => void }) {
   return (

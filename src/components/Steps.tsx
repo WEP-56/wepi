@@ -203,11 +203,13 @@ export function StepsDisclosure({
   onToggle,
   duration,
   steps,
+  running,
 }: {
   open: boolean;
   onToggle: () => void;
-  duration: number;
+  duration?: number;
   steps: Step[];
+  running?: boolean;
 }) {
   const actions = steps.filter((s) => s.kind === 'action').length;
   return (
@@ -219,7 +221,11 @@ export function StepsDisclosure({
         open && 'text-[var(--text-2)]',
       )}
     >
-      <span>用时 {formatDuration(duration)}</span>
+      {running ? (
+        <span className="shimmer-text">执行中…</span>
+      ) : (
+        <span>用时 {formatDuration(duration ?? 0)}</span>
+      )}
       <ChevronDown size={13} className={cn('transition-transform', open && 'rotate-180')} />
       {actions > 0 && (
         <span className="ml-1 text-[11.5px] text-[var(--text-3)] opacity-0 transition-opacity group-hover/dur:opacity-100">

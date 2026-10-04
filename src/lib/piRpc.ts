@@ -63,12 +63,20 @@ function ensureEventListener() {
   return eventListenerReady;
 }
 
-export async function listenPiRpc(handlers: {
+/**
+ * 订阅 Pi RPC 事件。
+ *
+ * 关键：本函数**同步**返回取消订阅函数，不等待底层 listener 建立。
+ * React StrictMode 下 effect 会「挂载→卸载→再挂载」，若取消订阅依赖
+ * 异步建立完成，第一次订阅就永远无法移除，事件会被处理两次——
+ * 表现为流式输出每一段都被拼接两遍。
+ */
+export function listenPiRpc(handlers: {
   event?: PiEventHandler;
   error?: (message: string) => void;
   exit?: (sessionKey?: string) => void;
   log?: (line: string) => void;
-}) {
+}): () => void {
   if (!isDesktopRuntime()) return () => {};
   const handler: PiEventHandler = (record, sessionKey) => {
     if (record.type === 'pi_rpc_error') {
@@ -86,10 +94,12 @@ export async function listenPiRpc(handlers: {
     handlers.event?.(record, sessionKey);
   };
   eventHandlers.add(handler);
-  const unlisten = await ensureEventListener();
+  void ensureEventListener();
+  let active = true;
   return () => {
+    if (!active) return;
+    active = false;
     eventHandlers.delete(handler);
-    void unlisten;
   };
 }
 
@@ -178,30 +188,30 @@ export async function requestPiRpc<T = unknown>(
   sessionKey?: string,
 ): Promise<T> {
   const id = `wepi-${Date.now()}-${++rpcSequence}`;
-  let timer: number | undefined;
-  let responseCleanup: (() => void) | undefined;
   const key = sessionKey ?? 'default';
+  let resolveRef: ((value: T) => void) | undefined;
+  let rejectRef: ((reason?: unknown) => void) | undefined;
   const response = new Promise<T>((resolve, reject) => {
-    void listenPiRpc({
-      event: (event) => {
-        if (event.type !== 'rpc_message' || event.message === undefined) return;
-        const message = event.message as PiRpcRecord;
-        if (message.id !== id) return;
-        if (message.success === false) reject(new Error(String(message.error ?? 'Pi RPC 请求失败')));
-        else resolve(message.data as T);
-      },
-      error: (message) => reject(new Error(message)),
-    }).then((unlisten) => {
-      timer = window.setTimeout(() => reject(new Error('Pi RPC 请求超时')), timeoutMs);
-      void sendPiRpc({ ...record, id }, key).catch(reject);
-      responseCleanup = unlisten;
-    }).catch(reject);
+    resolveRef = resolve;
+    rejectRef = reject;
   });
+  const cleanup = listenPiRpc({
+    event: (event) => {
+      if (event.type !== 'rpc_message' || event.message === undefined) return;
+      const message = event.message as PiRpcRecord;
+      if (message.id !== id) return;
+      if (message.success === false) rejectRef?.(new Error(String(message.error ?? 'Pi RPC 请求失败')));
+      else resolveRef?.(message.data as T);
+    },
+    error: (message) => rejectRef?.(new Error(message)),
+  });
+  const timer = window.setTimeout(() => rejectRef?.(new Error('Pi RPC 请求超时')), timeoutMs);
   try {
+    await sendPiRpc({ ...record, id }, key);
     return await response;
   } finally {
-    if (timer !== undefined) window.clearTimeout(timer);
-    responseCleanup?.();
+    window.clearTimeout(timer);
+    cleanup();
   }
 }
 
@@ -256,6 +266,15 @@ export interface PiSessionIndexEntry {
 export function scanPiSessions() {
   if (!isDesktopRuntime()) return Promise.resolve<PiSessionIndexEntry[]>([]);
   return invoke<{ sessions: PiSessionIndexEntry[] }>('pi_sessions_scan').then((r) => r.sessions ?? []);
+}
+
+/**
+ * 直接读取会话 JSONL 全文（不启动 Pi 进程）。
+ * 打开历史会话时用它渲染消息，避免为「看一眼」拉起 Node 进程造成卡顿。
+ */
+export function readPiSession(path: string) {
+  if (!isDesktopRuntime()) return Promise.resolve<Record<string, unknown>[]>([]);
+  return invoke<{ entries: Record<string, unknown>[] }>('pi_session_read', { path }).then((r) => r.entries ?? []);
 }
 
 /* ------------------------------------------------------------------ */

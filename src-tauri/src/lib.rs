@@ -5,63 +5,73 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{Arc, Condvar, Mutex},
-    time::{Duration, Instant},
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-/// One running `pi --mode rpc` process, keyed by WEPI session key.
+/// 单个会话的 RPC 进程。`ready` 是该进程独有的就绪标志——
+/// 多个会话并行运行时，A 的输出不能把 B 标记为就绪。
 struct RpcSlot {
     child: Child,
     stdin: ChildStdin,
+    ready: Arc<(Mutex<bool>, Condvar)>,
 }
 
 struct RpcProcess {
-    slots: Mutex<HashMap<String, RpcSlot>>,
-    /// Set to true (with condvar) once the process emitted its first valid JSON
-    /// line on stdout, proving the RPC endpoint is ready to accept commands.
-    ready: Arc<(Mutex<bool>, Condvar)>,
+    slots: Arc<Mutex<HashMap<String, RpcSlot>>>,
 }
 
 impl RpcProcess {
     fn new() -> Self {
         Self {
-            slots: Mutex::new(HashMap::new()),
-            ready: Arc::new((Mutex::new(false), Condvar::new())),
+            slots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
 
-    fn take(&self, key: &str) -> Option<RpcSlot> {
-        self.slots.lock().ok()?.remove(key)
-    }
+type Slots = Arc<Mutex<HashMap<String, RpcSlot>>>;
+type ReadyFlag = Arc<(Mutex<bool>, Condvar)>;
 
-    fn contains(&self, key: &str) -> bool {
-        self.slots.lock().map(|m| m.contains_key(key)).unwrap_or(false)
-    }
+fn take_slot(slots: &Slots, key: &str) -> Option<RpcSlot> {
+    slots.lock().ok()?.remove(key)
+}
 
-    fn with_stdin<R>(&self, key: &str, f: impl FnOnce(&mut ChildStdin) -> R) -> Result<R, String> {
-        let mut guard = self.slots.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?;
-        let slot = guard.get_mut(key).ok_or("该会话的 Pi RPC 尚未启动")?;
-        Ok(f(&mut slot.stdin))
-    }
+fn slot_exists(slots: &Slots, key: &str) -> bool {
+    slots.lock().map(|m| m.contains_key(key)).unwrap_or(false)
+}
 
-    fn wait_ready(&self, timeout: Duration) -> Result<(), String> {
-        let (lock, cvar) = &*self.ready;
-        let mut ready = lock.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?;
-        let deadline = Instant::now() + timeout;
-        while !*ready {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err("等待 Pi RPC 就绪超时（进程未输出有效 JSON）".to_owned());
-            }
-            let (guard, _timeout) = cvar.wait_timeout(ready, deadline - now).map_err(|e| e.to_string())?;
-            ready = guard;
+fn write_record(slots: &Slots, key: &str, record: &Value) -> Result<(), String> {
+    let mut guard = slots.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?;
+    let slot = guard.get_mut(key).ok_or("该会话的 Pi RPC 尚未启动")?;
+    let line = serde_json::to_string(record).map_err(|e| e.to_string())?;
+    slot.stdin
+        .write_all(line.as_bytes())
+        .and_then(|_| slot.stdin.write_all(b"\n"))
+        .and_then(|_| slot.stdin.flush())
+        .map_err(|e| format!("发送 RPC 命令失败：{e}"))
+}
+
+/// 等待某个会话的 RPC 进程输出第一行 JSON。阻塞式等待，必须放在
+/// spawn_blocking 里执行，否则会占住 Tauri 主线程造成界面卡死。
+fn wait_ready_blocking(ready: &ReadyFlag, timeout: Duration) -> Result<(), String> {
+    let (lock, cvar) = &**ready;
+    let mut flag = lock.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?;
+    let deadline = std::time::Instant::now() + timeout;
+    while !*flag {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err("等待 Pi RPC 就绪超时（进程未输出有效 JSON）".to_owned());
         }
-        Ok(())
+        let (guard, _) = cvar
+            .wait_timeout(flag, deadline - now)
+            .map_err(|e| e.to_string())?;
+        flag = guard;
     }
+    Ok(())
 }
 
 fn pi_agent_dir() -> PathBuf {
@@ -128,28 +138,40 @@ fn pi_config_read() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn pi_config_write(file: String, content: Value) -> Result<(), String> {
-    if !matches!(
-        file.as_str(),
-        "models.json" | "auth.json" | "settings.json" | "mcp.json"
-    ) {
-        return Err("不允许写入该 Pi 配置文件".to_owned());
-    }
-    let dir = pi_agent_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("无法创建 Pi 配置目录：{e}"))?;
-    let path = dir.join(file);
-    let raw = serde_json::to_string_pretty(&content).map_err(|e| e.to_string())?;
-    fs::write(path, format!("{raw}\n")).map_err(|e| format!("无法写入 Pi 配置：{e}"))
+async fn pi_config_write(file: String, content: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !matches!(
+            file.as_str(),
+            "models.json" | "auth.json" | "settings.json" | "mcp.json"
+        ) {
+            return Err("不允许写入该 Pi 配置文件".to_owned());
+        }
+        let dir = pi_agent_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("无法创建 Pi 配置目录：{e}"))?;
+        let path = dir.join(file);
+        let raw = serde_json::to_string_pretty(&content).map_err(|e| e.to_string())?;
+        fs::write(path, format!("{raw}\n")).map_err(|e| format!("无法写入 Pi 配置：{e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-/// Scan the Pi session store (~/.pi/agent/sessions) and return lightweight
-/// metadata for every session file: path, cwd, timestamps, size, preview.
-/// The frontend merges this with its own threads so WEPI and the Pi CLI share
-/// one session list (Pi JSONL stays the source of truth).
-#[tauri::command]
-fn pi_sessions_scan() -> Result<Value, String> {
+/* ------------------------------------------------------------------ */
+/*  会话索引：扫描 ~/.pi/agent/sessions                                 */
+/* ------------------------------------------------------------------ */
+
+/// 会话摘要缓存：path -> (size, mtime_ms, summary)。每 15 秒轮询时
+/// 未变化的文件直接复用，避免反复读取全部 JSONL。
+fn scan_cache() -> &'static Mutex<HashMap<String, (u64, u64, Value)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (u64, u64, Value)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn scan_sessions_blocking() -> Result<Value, String> {
     let root = pi_sessions_dir();
     let mut sessions = Vec::new();
+    let mut cache = scan_cache().lock().map_err(|_| "扫描缓存锁定失败".to_owned())?;
+    let mut seen: Vec<String> = Vec::new();
     let dirs = fs::read_dir(&root).map_err(|e| format!("无法读取 Pi sessions 目录：{e}"))?;
     for dir in dirs.filter_map(Result::ok) {
         let dir_path = dir.path();
@@ -169,49 +191,55 @@ fn pi_sessions_scan() -> Result<Value, String> {
                 Ok(meta) => meta,
                 Err(_) => continue,
             };
-            // Read only the first line (session header) + scan for name/preview.
-            let (header, name, preview, message_count) = match read_session_summary(&path) {
-                Some(v) => v,
-                None => continue,
-            };
-            if header.get("type").and_then(Value::as_str) != Some("session") {
-                continue;
-            }
-            let modified = meta
+            let key = path.to_string_lossy().into_owned();
+            let mtime_ms = meta
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            sessions.push(serde_json::json!({
-                "sessionPath": path.to_string_lossy(),
-                "sessionId": header.get("id").cloned().unwrap_or(Value::Null),
-                "cwd": header.get("cwd").cloned().unwrap_or(Value::Null),
-                "createdAt": header.get("timestamp").cloned().unwrap_or(Value::Null),
-                "modifiedAt": modified,
-                "fileSize": meta.len(),
-                "name": name,
-                "preview": preview,
-                "messageCount": message_count,
-            }));
+            seen.push(key.clone());
+            let summary = match cache.get(&key) {
+                Some((size, cached_mtime, value)) if *size == meta.len() && *cached_mtime == mtime_ms => {
+                    value.clone()
+                }
+                _ => {
+                    let Some(value) = read_session_summary(&path, meta.len(), mtime_ms) else {
+                        continue;
+                    };
+                    cache.insert(key.clone(), (meta.len(), mtime_ms, value.clone()));
+                    value
+                }
+            };
+            sessions.push(summary);
         }
     }
+    cache.retain(|path, _| seen.contains(path));
     sessions.sort_by(|a, b| {
-        b.get("modifiedAt").and_then(Value::as_u64).cmp(&a.get("modifiedAt").and_then(Value::as_u64))
+        b.get("modifiedAt")
+            .and_then(Value::as_u64)
+            .cmp(&a.get("modifiedAt").and_then(Value::as_u64))
     });
     Ok(serde_json::json!({ "sessions": sessions }))
 }
 
-/// Read a session JSONL file and return (header, name, preview, message_count).
-/// Only the first line is required; the rest is scanned cheaply line by line.
-fn read_session_summary(path: &Path) -> Option<(Value, Option<String>, Option<String>, u64)> {
-    use std::io::BufRead;
+#[tauri::command]
+async fn pi_sessions_scan() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(scan_sessions_blocking)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 读取会话文件的头部与会话级元数据。
+/// 只解析首行 header，以及 `session_info`（会话名）与首条 user 消息（预览），
+/// 其余行仅做廉价计数，避免大文件全量反序列化。
+fn read_session_summary(path: &Path, size: u64, mtime_ms: u64) -> Option<Value> {
     let file = fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
+    let reader = BufReader::new(file);
     let mut header: Option<Value> = None;
     let mut name: Option<String> = None;
     let mut preview: Option<String> = None;
-    let mut message_count: u64 = 0;
+    let mut user_messages: u64 = 0;
     for (index, line) in reader.lines().enumerate() {
         let line = match line {
             Ok(line) => line,
@@ -223,7 +251,6 @@ fn read_session_summary(path: &Path) -> Option<(Value, Option<String>, Option<St
             }
             continue;
         }
-        // Cheap substring checks before full JSON parse.
         if line.contains("\"session_info\"") {
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
                 if value.get("type").and_then(Value::as_str) == Some("session_info") {
@@ -232,8 +259,8 @@ fn read_session_summary(path: &Path) -> Option<(Value, Option<String>, Option<St
             }
             continue;
         }
-        if line.contains("\"message\"") && line.contains("\"role\":\"user\"") {
-            message_count += 1;
+        if line.contains("\"role\":\"user\"") {
+            user_messages += 1;
             if preview.is_none() {
                 if let Ok(value) = serde_json::from_str::<Value>(&line) {
                     let message = value.get("message").cloned().unwrap_or(Value::Null);
@@ -242,7 +269,49 @@ fn read_session_summary(path: &Path) -> Option<(Value, Option<String>, Option<St
             }
         }
     }
-    Some((header?, name, preview, message_count))
+    let header = header?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    Some(serde_json::json!({
+        "sessionPath": path.to_string_lossy(),
+        "sessionId": header.get("id").cloned().unwrap_or(Value::Null),
+        "cwd": header.get("cwd").cloned().unwrap_or(Value::Null),
+        "createdAt": header.get("timestamp").cloned().unwrap_or(Value::Null),
+        "modifiedAt": mtime_ms,
+        "fileSize": size,
+        "name": name,
+        "preview": preview,
+        "messageCount": user_messages,
+    }))
+}
+
+/// 直接读取会话 JSONL 全文并返回原始条目，用于打开历史会话时渲染。
+/// 相比启动 `pi --mode rpc --session` 再 `get_entries`，读文件几乎零成本，
+/// 也不会为了「看一眼」而拉起一个 Node 进程。
+#[tauri::command]
+async fn pi_session_read(path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        const MAX_ENTRIES: usize = 50_000;
+        let file = fs::File::open(&path).map_err(|e| format!("无法打开会话文件：{e}"))?;
+        let reader = BufReader::new(file);
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line.map_err(|e| e.to_string())?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                entries.push(value);
+            }
+            if entries.len() >= MAX_ENTRIES {
+                break;
+            }
+        }
+        Ok(serde_json::json!({ "entries": entries }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn message_text_from(message: &Value) -> Option<String> {
@@ -262,6 +331,10 @@ fn message_text_from(message: &Value) -> Option<String> {
         _ => None,
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  RPC 事件归一化                                                      */
+/* ------------------------------------------------------------------ */
 
 fn normalize_rpc_record(record: Value) -> Vec<Value> {
     let Some(kind) = record.get("type").and_then(Value::as_str) else {
@@ -337,6 +410,10 @@ fn normalize_rpc_record(record: Value) -> Vec<Value> {
     vec![record]
 }
 
+/* ------------------------------------------------------------------ */
+/*  Pi 可执行文件定位与进程启动                                          */
+/* ------------------------------------------------------------------ */
+
 fn locate_pi(executable: &str) -> String {
     if executable.trim() != "pi" {
         return executable.trim().to_owned();
@@ -388,8 +465,6 @@ fn locate_node() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// Build the `pi --mode rpc` command, handling Windows .cmd shims and the
-/// managed pi-launcher.js installation.
 fn build_pi_command(executable: &str, session_path: Option<&str>) -> Result<Command, String> {
     let program = locate_pi(executable);
     let managed_launcher = cfg!(windows)
@@ -434,20 +509,77 @@ fn build_pi_command(executable: &str, session_path: Option<&str>) -> Result<Comm
     Ok(command)
 }
 
-#[tauri::command]
-fn pi_rpc_start(
+/// 相邻事件合并：流式文本/思考块逐 token 到达，逐个发给 WebView 会让
+/// React 每 token 全量重渲染一次。合并后每 ~16ms 只发一条，行为与 pilo 一致。
+const RUNTIME_EVENT_BATCH_MS: u64 = 16;
+const MAX_BUFFERED_EVENTS: usize = 128;
+
+fn push_coalesced(buffer: &mut Vec<Value>, event: Value) {
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
+    match kind {
+        "assistant_text_delta" | "assistant_thinking_delta" => {
+            let same_kind = buffer
+                .last()
+                .and_then(|last| last.get("type").and_then(Value::as_str))
+                .is_some_and(|last_kind| last_kind == kind);
+            if same_kind {
+                let delta = event.get("delta").and_then(Value::as_str).unwrap_or_default();
+                if let Some(last) = buffer.last_mut() {
+                    let merged = {
+                        let existing = last.get("delta").and_then(Value::as_str).unwrap_or_default();
+                        format!("{existing}{delta}")
+                    };
+                    if let Some(obj) = last.as_object_mut() {
+                        obj.insert("delta".into(), Value::String(merged));
+                    }
+                    return;
+                }
+            }
+            buffer.push(event);
+        }
+        "tool_execution_update" => {
+            let same_tool = buffer.last().is_some_and(|last| {
+                last.get("type").and_then(Value::as_str) == Some("tool_execution_update")
+                    && last.get("toolCallId") == event.get("toolCallId")
+            });
+            if same_tool {
+                // 工具进度只需要最新快照，丢弃中间态。
+                if let Some(last) = buffer.last_mut() {
+                    *last = event;
+                }
+                return;
+            }
+            buffer.push(event);
+        }
+        _ => buffer.push(event),
+    }
+}
+
+/// 可合并的事件先入缓冲；其余事件必须先 flush，保证顺序不被重排。
+fn is_bufferable(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("assistant_text_delta" | "assistant_thinking_delta" | "tool_execution_update")
+    )
+}
+
+fn start_process_blocking(
     app: AppHandle,
-    state: State<'_, RpcProcess>,
+    slots: Slots,
     session_key: String,
     executable: String,
     cwd: Option<String>,
     session_path: Option<String>,
 ) -> Result<(), String> {
-    if state.contains(&session_key) {
+    if slot_exists(&slots, &session_key) {
         return Ok(());
     }
     let mut command = build_pi_command(
-        if executable.trim().is_empty() { "pi" } else { executable.trim() },
+        if executable.trim().is_empty() {
+            "pi"
+        } else {
+            executable.trim()
+        },
         session_path.as_deref(),
     )?;
     command
@@ -464,43 +596,91 @@ fn pi_rpc_start(
     let stdout = child.stdout.take().ok_or("无法打开 Pi RPC stdout")?;
     let stderr = child.stderr.take();
 
-    let ready_flag = state.ready.clone();
-    {
-        let (lock, _) = &*ready_flag;
-        if let Ok(mut ready) = lock.lock() {
-            *ready = false;
-        }
-    }
-    let key_for_exit = session_key.clone();
-    let events = app.clone();
+    let ready: ReadyFlag = Arc::new((Mutex::new(false), Condvar::new()));
+    let ready_out = ready.clone();
+    let key_for_reader = session_key.clone();
+    let (sender, receiver) = std::sync::mpsc::channel::<Result<Value, String>>();
+
+    // 读取线程：解析 JSONL 并归一化，只负责投递。
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             match line {
                 Ok(line) if !line.trim().is_empty() => {
-                    if let Ok(mut ready) = ready_flag.0.lock() {
-                        *ready = true;
+                    if let Ok(mut flag) = ready_out.0.lock() {
+                        *flag = true;
                     }
-                    ready_flag.1.notify_all();
-                    if let Ok(mut value) = serde_json::from_str::<Value>(&line) {
-                        // 给每条事件附加来源会话键，前端据此路由到正确的会话线程。
-                        if let Some(obj) = value.as_object_mut() {
-                            obj.insert("__sessionKey".into(), Value::String(key_for_exit.clone()));
+                    ready_out.1.notify_all();
+                    match serde_json::from_str::<Value>(&line) {
+                        Ok(mut value) => {
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert(
+                                    "__sessionKey".into(),
+                                    Value::String(key_for_reader.clone()),
+                                );
+                            }
+                            for event in normalize_rpc_record(value) {
+                                if sender.send(Ok(event)).is_err() {
+                                    return;
+                                }
+                            }
                         }
-                        for event in normalize_rpc_record(value) {
-                            let _ = events.emit("pi-rpc-event", event);
+                        Err(_) => {
+                            if sender
+                                .send(Err(format!("Pi 返回了无效 JSON：{line}")))
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
-                    } else {
-                        let _ = events.emit("pi-rpc-error", format!("Pi 返回了无效 JSON：{line}"));
                     }
                 }
                 _ => break,
             }
         }
+        // sender 随之 drop，刷新线程据此收尾。
+    });
+
+    // 刷新线程：16ms 窗口内合并流式增量后批量发给 WebView，并在收尾时清理槽位。
+    let events = app.clone();
+    let key_for_exit = session_key.clone();
+    std::thread::spawn(move || {
+        let mut buffer: Vec<Value> = Vec::new();
+        let flush = |buffer: &mut Vec<Value>| {
+            for event in buffer.drain(..) {
+                let _ = events.emit("pi-rpc-event", event);
+            }
+        };
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(RUNTIME_EVENT_BATCH_MS)) {
+                Ok(Ok(event)) => {
+                    if is_bufferable(&event) {
+                        push_coalesced(&mut buffer, event);
+                        if buffer.len() >= MAX_BUFFERED_EVENTS {
+                            flush(&mut buffer);
+                        }
+                    } else {
+                        // 非增量事件（开始/结束/工具边界）先冲刷，保持时序。
+                        flush(&mut buffer);
+                        let _ = events.emit("pi-rpc-event", event);
+                    }
+                }
+                Ok(Err(message)) => {
+                    flush(&mut buffer);
+                    let _ = events.emit("pi-rpc-error", message);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => flush(&mut buffer),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    flush(&mut buffer);
+                    break;
+                }
+            }
+        }
         let _ = events.emit("pi-rpc-exit", &key_for_exit);
         if let Some(state) = events.try_state::<RpcProcess>() {
-            state.take(&key_for_exit);
+            take_slot(&state.slots, &key_for_exit);
         }
     });
+
     if let Some(stderr) = stderr {
         let diagnostics = app;
         std::thread::spawn(move || {
@@ -512,54 +692,186 @@ fn pi_rpc_start(
                 }
             }
             if !diagnostics_text.is_empty() {
-                let _ = diagnostics
-                    .emit("pi-rpc-error", diagnostics_text.join("\n"));
+                let _ = diagnostics.emit("pi-rpc-error", diagnostics_text.join("\n"));
             }
         });
     }
-    state.slots.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?.insert(session_key, RpcSlot { child, stdin });
+    slots
+        .lock()
+        .map_err(|_| "RPC 状态锁定失败".to_owned())?
+        .insert(session_key, RpcSlot { child, stdin, ready });
     Ok(())
 }
 
-/// Wait until the freshly started RPC process emitted its first JSON line.
-/// Called by the frontend right after pi_rpc_start so configuration RPCs never
-/// race the Node.js bootstrap of the pi CLI.
 #[tauri::command]
-fn pi_rpc_wait_ready(state: State<'_, RpcProcess>, timeout_ms: Option<u64>) -> Result<(), String> {
+async fn pi_rpc_start(
+    app: AppHandle,
+    state: State<'_, RpcProcess>,
+    session_key: String,
+    executable: String,
+    cwd: Option<String>,
+    session_path: Option<String>,
+) -> Result<(), String> {
+    let slots = state.slots.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        start_process_blocking(app, slots, session_key, executable, cwd, session_path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pi_rpc_wait_ready(
+    state: State<'_, RpcProcess>,
+    session_key: String,
+    timeout_ms: Option<u64>,
+) -> Result<(), String> {
+    let ready = {
+        let guard = state.slots.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?;
+        guard
+            .get(&session_key)
+            .ok_or("该会话的 Pi RPC 尚未启动")?
+            .ready
+            .clone()
+    };
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(20_000));
-    state.wait_ready(timeout)
+    tauri::async_runtime::spawn_blocking(move || wait_ready_blocking(&ready, timeout))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn pi_rpc_send(state: State<'_, RpcProcess>, session_key: String, record: Value) -> Result<(), String> {
-    state.with_stdin(&session_key, |stdin| {
-        let line = serde_json::to_string(&record).map_err(|e| e.to_string())?;
-        stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .and_then(|_| stdin.flush())
-            .map_err(|e| format!("发送 RPC 命令失败：{e}"))
-    })?
+async fn pi_rpc_send(
+    state: State<'_, RpcProcess>,
+    session_key: String,
+    record: Value,
+) -> Result<(), String> {
+    let slots = state.slots.clone();
+    tauri::async_runtime::spawn_blocking(move || write_record(&slots, &session_key, &record))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn pi_rpc_stop(state: State<'_, RpcProcess>, session_key: String) -> Result<(), String> {
-    if let Some(mut slot) = state.take(&session_key) {
-        let _ = slot.stdin.flush();
-        let _ = slot.child.kill();
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn pi_rpc_stop_all(state: State<'_, RpcProcess>) -> Result<(), String> {
-    if let Ok(mut slots) = state.slots.lock() {
-        for (_, mut slot) in slots.drain() {
+async fn pi_rpc_stop(state: State<'_, RpcProcess>, session_key: String) -> Result<(), String> {
+    let slots = state.slots.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(mut slot) = take_slot(&slots, &session_key) {
             let _ = slot.stdin.flush();
             let _ = slot.child.kill();
+            let _ = slot.child.wait();
         }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pi_rpc_stop_all(state: State<'_, RpcProcess>) -> Result<(), String> {
+    let slots = state.slots.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let drained: Vec<(String, RpcSlot)> = match slots.lock() {
+            Ok(mut guard) => guard.drain().collect(),
+            Err(_) => return,
+        };
+        for (_, mut slot) in drained {
+            let _ = slot.stdin.flush();
+            let _ = slot.child.kill();
+            let _ = slot.child.wait();
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn coalesces_adjacent_text_and_thinking_deltas() {
+        let mut buffer = Vec::new();
+        for (kind, delta) in [
+            ("assistant_text_delta", "你"),
+            ("assistant_text_delta", "好"),
+            ("assistant_thinking_delta", "想"),
+            ("assistant_thinking_delta", "一下"),
+        ] {
+            push_coalesced(&mut buffer, json!({"type": kind, "delta": delta}));
+        }
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0]["delta"], json!("你好"));
+        assert_eq!(buffer[1]["delta"], json!("想一下"));
     }
-    Ok(())
+
+    #[test]
+    fn keeps_only_latest_tool_execution_update() {
+        let mut buffer = Vec::new();
+        push_coalesced(
+            &mut buffer,
+            json!({"type": "tool_execution_update", "toolCallId": "c1", "partialResult": "first"}),
+        );
+        push_coalesced(
+            &mut buffer,
+            json!({"type": "tool_execution_update", "toolCallId": "c1", "partialResult": "latest"}),
+        );
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer[0]["partialResult"], json!("latest"));
+    }
+
+    #[test]
+    fn separates_deltas_from_different_tools_and_event_boundaries() {
+        let mut buffer = Vec::new();
+        push_coalesced(&mut buffer, json!({"type": "assistant_text_delta", "delta": "a"}));
+        push_coalesced(&mut buffer, json!({"type": "tool_execution_update", "toolCallId": "c1"}));
+        push_coalesced(&mut buffer, json!({"type": "tool_execution_update", "toolCallId": "c2"}));
+        push_coalesced(&mut buffer, json!({"type": "assistant_text_delta", "delta": "b"}));
+        assert_eq!(buffer.len(), 4, "不同类型的增量不能被错误合并");
+    }
+
+    #[test]
+    fn bufferable_classification_matches_pilo_contract() {
+        assert!(is_bufferable(&json!({"type": "assistant_text_delta"})));
+        assert!(is_bufferable(&json!({"type": "assistant_thinking_delta"})));
+        assert!(is_bufferable(&json!({"type": "tool_execution_update"})));
+        // 边界事件必须立即下发，否则会打乱时序。
+        assert!(!is_bufferable(&json!({"type": "assistant_message_end"})));
+        assert!(!is_bufferable(&json!({"type": "agent_settled"})));
+        assert!(!is_bufferable(&json!({"type": "tool_execution_start"})));
+    }
+
+    #[test]
+    fn normalizes_message_lifecycle_into_frontend_events() {
+        // assistant message_end -> assistant_message_end（收尾快照）
+        let events = normalize_rpc_record(json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}
+        }));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], json!("assistant_message_end"));
+
+        // system message_end 不能污染助手消息
+        let events = normalize_rpc_record(json!({
+            "type": "message_end",
+            "message": {"role": "system", "content": []}
+        }));
+        assert_eq!(events[0]["type"], json!("message_end"));
+
+        // text_delta -> assistant_text_delta
+        let events = normalize_rpc_record(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "x"}
+        }));
+        assert_eq!(events[0]["type"], json!("assistant_text_delta"));
+
+        // 未知增量类型（text_start/text_end）原样透传，由前端忽略
+        let events = normalize_rpc_record(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_start"}
+        }));
+        assert_eq!(events[0]["type"], json!("message_update"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -574,7 +886,8 @@ pub fn run() {
             pi_rpc_wait_ready,
             pi_config_read,
             pi_config_write,
-            pi_sessions_scan
+            pi_sessions_scan,
+            pi_session_read
         ])
         .run(tauri::generate_context!())
         .expect("error while running WEPI");
