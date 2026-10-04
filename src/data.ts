@@ -53,6 +53,14 @@ export interface Thread {
   pinned?: boolean;
   unread?: boolean;
   archived?: boolean;
+  /** Pi 会话文件绝对路径（~/.pi/agent/sessions/.../*.jsonl）；存在即代表可恢复 */
+  piSessionPath?: string | null;
+  /** Pi 侧工作目录（启动 RPC 进程时作为 cwd） */
+  piCwd?: string | null;
+  /** 该会话的 RPC 进程键（内部使用） */
+  rpcKey?: string | null;
+  /** 上次同步到的文件大小，用于检测 Pi 侧追加 */
+  piFileSize?: number;
 }
 
 export interface Project {
