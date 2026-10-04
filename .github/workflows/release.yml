@@ -1,0 +1,114 @@
+# WEPI 发布流水线
+#
+# 触发：推送 v* 形式的 tag（如 v0.1.0）
+# 产物：
+#   1. Windows NSIS 安装包（wepi_x.y.z_x64-setup.exe）
+#   2. Windows 免安装绿色包（wepi_x.y.z_x64-portable.zip）
+# 发步：打包完成直接创建 GitHub Release 并附上两个产物。
+#
+# 绿色包说明：Tauri 在 Windows 上只依赖系统自带的 WebView2（Win11 内置，
+# Win10 绝大多数已随 Edge 安装），portable zip 只需 wepi.exe 即可运行；
+# 首次启动若缺 WebView2，exe 会提示安装（Tauri bootstrap 自带下载引导）。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # 创建 Release 与上传产物
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust（MSVC）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust 缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 读取版本号
+        id: ver
+        shell: pwsh
+        run: |
+          # 版本以 tauri.conf.json 为准（tag 名可能带 v 前缀，二者保持一致）
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $version = $conf.version
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$($env:GITHUB_REF_NAME)" >> $env:GITHUB_OUTPUT
+          Write-Output "tauri.conf.json version = $version, tag = $($env:GITHUB_REF_NAME)"
+
+      - name: 构建安装包（NSIS）
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ steps.ver.outputs.tag }}
+          releaseName: 'WEPI ${{ steps.ver.outputs.tag }}'
+          releaseBody: '见 Assets 下载安装包（setup.exe）或免安装绿色包（portable.zip）。'
+          releaseDraft: false
+          releasePrerelease: false
+          # tauri-action 自带 NSIS 打包；这里不传 args，用项目默认 bundle targets（nsis）
+
+      - name: 定位构建产物
+        id: artifacts
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw "NSIS setup.exe 未找到" }
+          "setup=$($setup.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Output "setup: $($setup.FullName)"
+
+      - name: 制作免安装绿色包（portable）
+        id: portable
+        shell: pwsh
+        run: |
+          $version = '${{ steps.ver.outputs.version }}'
+          $zipName = "wepi_${version}_x64-portable.zip"
+          $staging = New-Item -ItemType Directory -Path "portable-staging" -Force
+          # 绿色包 = wepi.exe + 一份简短说明
+          Copy-Item src-tauri/target/release/wepi.exe -Destination $staging.FullName
+          @'
+          WEPI 免安装绿色版
+          ==================
+
+          1. 解压到任意目录（建议不含中文与空格的路径）
+          2. 双击 wepi.exe 运行；数据保存在 %USERPROFILE%\.wepi\
+          3. 需要 WebView2 Runtime（Windows 11 内置；Windows 10 缺失时
+             首次启动会引导安装）
+
+          Pi Coding Agent 需另行安装（https://pi.dev）。
+          '@ | Set-Content -Path (Join-Path $staging.FullName 'README.txt') -Encoding UTF8
+          Compress-Archive -Path (Join-Path $staging.FullName '*') -DestinationPath $zipName -Force
+          "zip=$((Get-Item $zipName).FullName)" >> $env:GITHUB_OUTPUT
+          Write-Output "portable: $zipName"
+
+      - name: 上传绿色包到 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          # tauri-action 已创建 Release 并上传了 setup.exe；这里把 portable.zip 补传上去
+          $tag = '${{ steps.ver.outputs.tag }}'
+          gh release upload $tag '${{ steps.portable.outputs.zip }}' --clobber
