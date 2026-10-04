@@ -126,7 +126,7 @@ const splitRow = (line: string) =>
     .split('|')
     .map((cell) => cell.trim());
 
-function Markdown({ text, caret }: { text: string; caret?: boolean }) {
+function Markdown({ text, caret, onLink }: { text: string; caret?: boolean; onLink?: (href: string) => void }) {
   const lines = text.split('\n');
   const blocks: ReactNode[] = [];
   let list: { ordered: boolean; items: string[] } | null = null;
@@ -279,7 +279,7 @@ function Markdown({ text, caret }: { text: string; caret?: boolean }) {
   }
   flushList(`ul${lines.length}`);
 
-  return <div className={'text-[14px] leading-[24px] text-[var(--text)] ' + (caret ? 'caret' : '')}>{blocks}</div>;
+  return <div onClick={(event) => { const anchor = (event.target as HTMLElement).closest('a'); if (!anchor || !onLink) return; event.preventDefault(); onLink(anchor.getAttribute('href') ?? ''); }} className={'text-[14px] leading-[24px] text-[var(--text)] ' + (caret ? 'caret' : '')}>{blocks}</div>;
 }
 
 // 流式期间父组件每个批次都会重渲染，未变动的消息靠 memo 跳过整段解析。

@@ -12,7 +12,6 @@ import {
   ArrowUpRight,
   Archive,
   Trash2,
-  CirclePlus,
   Clock,
   Settings as SettingsIcon,
   X,
@@ -48,6 +47,7 @@ import {
 } from './lib/piRpc';
 import { projectPiEntries, titleFromIndexEntry, type PiEntry } from './lib/piSession';
 import { applyPiEvent, createTurnState, displayContent, type PiTurnState } from './lib/piEventReducer';
+import { fileTarget, workspace, type PanelTarget, type Review } from './lib/workspace';
 import type { UsageSnapshot } from './components/ContextUsage';
 import {
   efforts,
@@ -166,7 +166,8 @@ export default function App() {
   const [rightOpen, setRightOpen] = useState(false);
   const [rightW, setRightW] = useState(366);
   const [rightCover, setRightCover] = useState(false);
-  const [openKind, setOpenKind] = useState<{ kind: TabKind; n: number } | null>(null);
+  const [openKind, setOpenKind] = useState<{ kind: TabKind; n: number; reviewId?: string } | null>(null);
+  const [panelTarget, setPanelTarget] = useState<PanelTarget | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [composer, setComposer] = useState<ComposerSettings>(() => {
     try {
@@ -196,7 +197,7 @@ export default function App() {
   navRef.current = nav;
   const lastHome = useRef<string | null>(null);
   /** 正在进行的回合：按 RPC 会话键索引，支持多会话并行运行 */
-  const piRuns = useRef(new Map<string, { threadId: string; messageId: string; rpcKey: string; state: PiTurnState }>());
+  const piRuns = useRef(new Map<string, { threadId: string; messageId: string; rpcKey: string; turnId: string; cwd?: string | null; state: PiTurnState }>());
   const piModelsConfig = useRef<Record<string, Record<string, unknown>>>({});
   /** 会话打开请求的代际号，防止旧请求覆盖新导航 */
   const openGeneration = useRef(0);
@@ -429,9 +430,15 @@ export default function App() {
     go({ view: 'home', threadId: null });
   };
   const openSettings = () => go({ view: 'settings', threadId: null });
-  const openPanel = (kind: TabKind) => {
+  const openPanel = (kind: TabKind, reviewId?: string) => {
     setRightOpen(true);
-    setOpenKind({ kind, n: Date.now() });
+    setPanelTarget(null);
+    setOpenKind({ kind, n: Date.now(), reviewId });
+  };
+  const openChatLink = (href: string) => {
+    const target = fileTarget(href);
+    if (target) { setPanelTarget({ ...target, n: Date.now() }); setRightOpen(true); return; }
+    window.open(href, '_blank', 'noopener,noreferrer');
   };
   const expand = (pid: string | null) => {
     if (pid) setExpanded((e) => (e.includes(pid) ? e : [...e, pid]));
@@ -615,7 +622,6 @@ export default function App() {
         rename,
         pin,
         div,
-        { label: '新建侧边聊天', icon: <CirclePlus size={15} />, shortcut: 'Alt+Ctrl+S', onClick: () => openPanel('chat') },
         fork,
         { label: '添加计划任务…', icon: <Clock size={15} />, onClick: () => setDialog({ kind: 'schedule', threadId: t.id }) },
         div,
@@ -761,6 +767,11 @@ export default function App() {
           }));
         }
         if (record.type === 'agent_settled' && next.finished) {
+          const turnId = run.turnId;
+          void workspace<Review & { id: string }>('turn_end', run.cwd ?? '', { id: turnId }).then((review) => {
+            const edits = review.files.map((file) => ({ file: file.file, add: file.add, del: file.del }));
+            setThreads((ts) => ts.map((thread) => thread.id === run.threadId ? { ...thread, lastTurnId: review.id, messages: thread.messages.map((message) => message.id === run.messageId ? { ...message, edits: edits.length ? edits : undefined } : message) } : thread));
+          }).catch(() => {});
           if (navRef.current.threadId !== run.threadId || navRef.current.view !== 'home')
             setThreads((ts) => ts.map((thread) => thread.id === run.threadId ? { ...thread, unread: true } : thread));
           piRuns.current.delete(run.rpcKey);
@@ -823,14 +834,21 @@ export default function App() {
       const rpcKey = current?.rpcKey ?? `rpc-${rpcThreadId}`;
       const workingDirectory = current?.piCwd ?? project?.path ?? null;
       const sessionPath = current?.piSessionPath ?? null;
+      // Turn snapshot ids are local filenames; imported Pi session ids may contain
+      // slashes or colons, so never use the thread id as the filename stem.
+      const turnId = `turn-${Date.now().toString(36)}-${aid}`;
       void (async () => {
+        if (workingDirectory) {
+          await workspace('turn_begin', workingDirectory, { id: turnId });
+          mutate((prev) => ({ ...prev, threads: prev.threads.map((thread) => thread.id === rpcThreadId ? { ...thread, lastTurnId: turnId } : thread) }));
+        }
         // 每个会话独立 RPC 进程；绑定相同 cwd+session 时复用。
         await ensurePiSession({ sessionKey: rpcKey, cwd: workingDirectory, sessionPath });
         mutate((prev) => ({
           ...prev,
           threads: prev.threads.map((t) => (t.id === rpcThreadId ? { ...t, rpcKey, piCwd: t.piCwd ?? workingDirectory } : t)),
         }));
-        piRuns.current.set(rpcKey, { threadId: rpcThreadId, messageId: aid, rpcKey, state: createTurnState(runStartedAt) });
+        piRuns.current.set(rpcKey, { threadId: rpcThreadId, messageId: aid, rpcKey, turnId, cwd: workingDirectory, state: createTurnState(runStartedAt) });
         // 模型与思考档位由 Pi 持有。仅当本地选择确实存在于 Pi 的可用目录中时才下发，
         // 否则沿用 Pi 自己的配置——避免陈旧/拼错的模型导致 "Model not found"。
         const catalog = await requestPiRpc<{ models?: { id: string; name?: string; provider: string }[] }>(
@@ -965,7 +983,6 @@ export default function App() {
       if (e.altKey) {
         if (k === 'r' && t) { e.preventDefault(); startRename(t.id, 'header'); }
         else if (k === 'p' && t) { e.preventDefault(); patchThread(t.id, { pinned: !t.pinned }); }
-        else if (k === 's') { e.preventDefault(); openPanel('chat'); }
         return;
       }
       if (e.shiftKey) {
@@ -1092,15 +1109,15 @@ export default function App() {
                   onToast={showToast}
                 />
               )}
-              <div ref={bodyRef} className="relative flex min-w-0 flex-1">
-                <div className="flex min-w-0 flex-1 flex-col bg-[var(--bg-main)]">
+              <div ref={bodyRef} className="relative flex h-full min-h-0 min-w-0 flex-1">
+                <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-[var(--bg-main)]">
                   {activeThread ? (
                     <ChatView
                       thread={activeThread}
                       project={project}
                       rightOpen={rightOpen}
                       onToggleRight={() => setRightOpen((o) => !o)}
-                      onViewChanges={() => openPanel('diff')}
+                      onViewChanges={() => openPanel('diff', activeThread.lastTurnId ?? undefined)}
                       onMenu={(x, y) => setMenu({ x, y, items: threadMenu(activeThread, 'header') })}
                       renaming={renaming?.id === activeThread.id && renaming.from === 'header'}
                       onRenameSubmit={(title) => {
@@ -1109,6 +1126,7 @@ export default function App() {
                       }}
                       onRenameCancel={() => setRenaming(null)}
                       onToast={showToast}
+                      onOpenLink={openChatLink}
                     />
                   ) : (
                     <EmptyState project={project} rightOpen={rightOpen} onToggleRight={() => setRightOpen((o) => !o)} />
@@ -1140,6 +1158,8 @@ export default function App() {
                     cover={rightCover}
                     onStartDrag={startRightDrag}
                     onToggleCover={() => setRightCover((c) => !c)}
+                    workspaceRoot={project?.path ?? undefined}
+                    target={panelTarget}
                   />
                 )}
               </div>

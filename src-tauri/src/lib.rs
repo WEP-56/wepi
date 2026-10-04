@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, Condvar, Mutex, OnceLock},
     time::Duration,
 };
+mod workspace;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(windows)]
@@ -986,7 +987,7 @@ mod tests {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(RpcProcess::new())
+        .manage(RpcProcess::new()).manage(workspace::WorkspaceState::default())
         .invoke_handler(tauri::generate_handler![
             pi_rpc_start,
             pi_rpc_send,
@@ -998,6 +999,7 @@ pub fn run() {
             pi_sessions_scan,
             pi_session_read,
             pi_session_delete
+            ,workspace::workspace_request, workspace::terminal_start, workspace::terminal_write, workspace::terminal_resize, workspace::terminal_close, workspace::browser_control
         ])
         .run(tauri::generate_context!())
         .expect("error while running WEPI");

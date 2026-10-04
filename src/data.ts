@@ -63,6 +63,8 @@ export interface Thread {
   rpcKey?: string | null;
   /** 上次同步到的文件大小，用于检测 Pi 侧追加 */
   piFileSize?: number;
+  /** 最近一次 Agent 回合的文件快照标识 */
+  lastTurnId?: string | null;
 }
 
 export interface Project {

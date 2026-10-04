@@ -314,7 +314,7 @@ export default function Settings({
             <Section title="快捷键">
               {[
                 ['新聊天', 'Ctrl+N'], ['切换边栏', 'Ctrl+B'], ['搜索聊天', 'Ctrl+K'], ['打开设置', 'Ctrl+,'],
-                ['变更', 'Ctrl+Shift+G'], ['终端', 'Ctrl+`'], ['文件', 'Ctrl+P'], ['侧边聊天', 'Ctrl+Alt+S'],
+                ['变更', 'Ctrl+Shift+G'], ['终端', 'Ctrl+`'], ['文件', 'Ctrl+P'],
                 ['重命名聊天', 'Alt+Ctrl+R'], ['置顶聊天', 'Alt+Ctrl+P'], ['标记为未读', 'Ctrl+Shift+U'], ['归档聊天', 'Ctrl+Shift+A'],
               ].map(([a, k]) => (
                 <Row key={a} title={a}><Kbd>{k}</Kbd></Row>

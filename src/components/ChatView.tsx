@@ -65,7 +65,7 @@ function fallbackSteps(m: Message): Step[] {
   }));
 }
 
-function AssistantMsgBase({ m, onView, onToast }: { m: Message; onView: () => void; onToast: (s: string) => void }) {
+function AssistantMsgBase({ m, onView, onToast, onLink }: { m: Message; onView: () => void; onToast: (s: string) => void; onLink: (href: string) => void }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const steps = m.steps ?? fallbackSteps(m);
@@ -97,7 +97,7 @@ function AssistantMsgBase({ m, onView, onToast }: { m: Message; onView: () => vo
           )}
         </div>
       )}
-      <Markdown text={m.content} caret={m.streaming} />
+      <Markdown text={m.content} caret={m.streaming} onLink={onLink} />
       {m.edits && !m.streaming && <EditCard edits={m.edits} onView={onView} onToast={onToast} />}
       {!m.streaming && (
         <div className="mt-3 flex items-center gap-1 text-[var(--text-3)]">
@@ -158,6 +158,7 @@ export default function ChatView({
   onRenameSubmit,
   onRenameCancel,
   onToast,
+  onOpenLink,
 }: {
   thread: Thread;
   project: Project | null;
@@ -169,6 +170,7 @@ export default function ChatView({
   onRenameSubmit: (title: string) => void;
   onRenameCancel: () => void;
   onToast: (s: string) => void;
+  onOpenLink: (href: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const moreRef = useRef<HTMLButtonElement>(null);
@@ -268,7 +270,7 @@ export default function ChatView({
                 </div>
               ) : (
                 <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-6 scroll-mt-24">
-                  <AssistantMsg m={m} onView={onViewChanges} onToast={onToast} />
+                  <AssistantMsg m={m} onView={onViewChanges} onToast={onToast} onLink={onOpenLink} />
                 </div>
               ),
             )}
