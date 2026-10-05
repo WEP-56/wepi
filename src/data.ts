@@ -49,14 +49,53 @@ export type TurnBlock =
       isError?: boolean;
     };
 
+/** 输入框 / 消息携带的附件。图片用 data URL 直接渲染，文件只用路径。 */
+export interface Attachment {
+  id: string;
+  kind: 'image' | 'file';
+  /** 展示名（图片为文件名或“粘贴的图片”，文件为路径末段） */
+  name: string;
+  /**
+   * 图片：data URL（缩略图与原图共用），持久化时会被剥离以保护 localStorage 配额；
+   * 文件：显示用的绝对路径或文件名。
+   */
+  value: string;
+  /** 桌面端可得的绝对磁盘路径——Pi 需要靠它读到真实文件 */
+  path?: string;
+}
+
+/**
+ * 任务进行中发送的消息：默认排队，等当前回合结束自动发送。
+ * 输入框上方悬浮栏展示，提供「引导」（立即插入当前回合）与
+ * 「撤回」（内容放回输入框）两种操作。
+ */
+export interface PendingSend {
+  id: string;
+  text: string;
+  attachments: Attachment[];
+}
+
+/** 每个会话（或“新会话”）各自的输入框草稿。 */
+export interface ComposerDraft {
+  text: string;
+  attachments: Attachment[];
+}
+
 export interface Message {
   id: string;
   role: Role;
   /** 旧字段：内容全文（历史消息迁移用；新消息以 blocks 为准渲染） */
   content: string;
+  /** 用户消息的附件：图片悬浮在气泡上方，文件以路径 chip 呈现 */
+  attachments?: Attachment[];
   blocks?: TurnBlock[];
   duration?: number;
   edits?: FileEdit[];
+  /**
+   * 该消息是任务进行中通过「引导」插入当前回合的（pi steer 语义），
+   * 气泡上方显示「已插入当前任务」角标；被 Pi 消费后清除。
+   */
+  steered?: boolean;
   /** @deprecated 旧流式标志；流式期间最后一个 text block 自带增长语义 */
   streaming?: boolean;
   thinking?: boolean;

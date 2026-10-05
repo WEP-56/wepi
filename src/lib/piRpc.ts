@@ -237,6 +237,96 @@ export function promptRecord(id: string, message: string) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Extension UI 子协议（pi 扩展的对话/挂件请求）                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * pi 扩展经 RPC Extension UI 协议发起的请求（stdout → 前端）。
+ * 对话方法（select/confirm/input/editor）需要回 extension_ui_response；
+ * fire-and-forget 方法（notify/setWidget/...）无需响应。
+ */
+export interface ExtensionUiRequest {
+  __sessionKey?: string;
+  type: 'extension_ui_request';
+  id: string;
+  method: string;
+  title?: string;
+  message?: string;
+  options?: string[];
+  timeout?: number;
+  widgetKey?: string;
+  widgetLines?: string[];
+  widgetPlacement?: 'aboveEditor' | 'belowEditor';
+  notifyType?: 'info' | 'warning' | 'error';
+  [key: string]: unknown;
+}
+
+const DIALOG_METHODS = new Set(['select', 'confirm', 'input', 'editor']);
+
+export function isExtensionUiRequest(record: PiRpcEvent): record is PiRpcEvent & ExtensionUiRequest {
+  return record.type === 'extension_ui_request' && typeof (record as Record<string, unknown>).id === 'string';
+}
+
+export function isDialogMethod(request: ExtensionUiRequest): boolean {
+  return DIALOG_METHODS.has(request.method);
+}
+
+/** 把用户的选择回给 pi（写 extension_ui_response 到 stdin，按 id 关联）。 */
+export async function respondExtensionUi(
+  sessionKey: string,
+  requestId: string,
+  outcome: { value?: string; confirmed?: boolean; cancelled?: boolean },
+) {
+  const payload: Record<string, unknown> = { id: requestId };
+  if (outcome.cancelled) payload.cancelled = true;
+  else if (outcome.confirmed !== undefined) payload.confirmed = outcome.confirmed;
+  else if (outcome.value !== undefined) payload.value = outcome.value;
+  await invoke('pi_rpc_respond_ui', { sessionKey, payload });
+}
+
+/* ------------------------------------------------------------------ */
+/*  WEPI 安全管理（等级配置 + 会话覆盖）                                 */
+/* ------------------------------------------------------------------ */
+
+export interface SecurityLevelConfig {
+  id: string;
+  name: string;
+  description: string;
+  builtin?: boolean;
+  toolActions: Partial<Record<string, 'allow' | 'ask' | 'deny'>>;
+  denyBashPatterns: string[];
+  pathPolicy: 'unrestricted' | 'workspace' | 'custom';
+  customAllowDirs: string[];
+  denyDirs: string[];
+  protectSensitivePaths: boolean;
+  defaultAction: 'allow' | 'ask' | 'deny';
+}
+
+export interface SecuritySnapshot {
+  schemaVersion: number;
+  enabled: boolean;
+  defaultLevelId: string;
+  levels: SecurityLevelConfig[];
+  sessionLevels: Record<string, string>;
+}
+
+export function fetchSecuritySnapshot() {
+  if (!isDesktopRuntime()) return Promise.reject(new Error('仅在桌面应用中可用'));
+  return invoke<SecuritySnapshot>('wepi_security_snapshot');
+}
+
+export function saveSecurityConfig(config: Record<string, unknown>) {
+  if (!isDesktopRuntime()) return Promise.reject(new Error('仅在桌面应用中可用'));
+  return invoke<SecuritySnapshot>('wepi_security_save', { config });
+}
+
+/** 会话级等级覆盖；levelId 为 null 时清除该会话的覆盖。 */
+export function setSessionSecurityLevel(sessionId: string, levelId: string | null) {
+  if (!isDesktopRuntime()) return Promise.reject(new Error('仅在桌面应用中可用'));
+  return invoke<SecuritySnapshot>('wepi_security_set_session_level', { sessionId, levelId });
+}
+
+/* ------------------------------------------------------------------ */
 /*  Pi 配置                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -262,6 +352,28 @@ export function readPiConfig() {
 export function writePiConfig(file: 'models.json' | 'auth.json' | 'settings.json' | 'mcp.json', content: unknown) {
   if (!isDesktopRuntime()) return Promise.reject(new Error('Pi 配置只能在桌面应用中写入'));
   return invoke('pi_config_write', { file, content });
+}
+
+export function fetchProviderModels(url: string, headers: Record<string, string>) {
+  if (isDesktopRuntime()) {
+    return invoke<unknown>('pi_provider_models_fetch', { url, headers });
+  }
+  return fetch(url, { headers }).then(async (response) => {
+    if (!response.ok) throw new Error(`接口返回 HTTP ${response.status}`);
+    return response.json() as Promise<unknown>;
+  });
+}
+
+/** 读取本地图片为 data URL（桌面端），供附件缩略图与查看原图。 */
+export function readImageDataUrl(path: string) {
+  if (!isDesktopRuntime()) return Promise.reject(new Error('仅在桌面应用中可用'));
+  return invoke<string>('read_image_data_url', { path });
+}
+
+/** 把粘贴的图片落盘到临时目录并返回绝对路径，使 Pi 能按路径读到它。 */
+export function saveTempImage(dataUrl: string) {
+  if (!isDesktopRuntime()) return Promise.reject(new Error('仅在桌面应用中可用'));
+  return invoke<string>('save_temp_image', { dataUrl });
 }
 
 /* ------------------------------------------------------------------ */

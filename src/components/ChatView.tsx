@@ -6,15 +6,18 @@ import {
   Copy,
   Share,
   FileDiff,
+  FileText,
   Undo2,
   Check,
   SquarePlus,
   ArrowDown,
+  CornerUpLeft,
 } from 'lucide-react';
-import type { Message, Project, Thread, FileEdit, TurnBlock } from '../data';
+import type { Attachment, Message, Project, Thread, FileEdit, TurnBlock } from '../data';
 import { ActivityTimeline, streamingLabelOf } from './ActivityView';
 import Markdown from './Markdown';
 import MessageNavigator from './MessageNavigator';
+import { AttachmentThumb, ImageViewer } from './Attachments';
 import { AppIcon, IconBtn } from './ui';
 import { RenameInput } from './kit';
 import { cn } from '../utils/cn';
@@ -196,6 +199,8 @@ export default function ChatView({
   const ownership = useRef<'following' | 'reading'>('following');
   const [showToLatest, setShowToLatest] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
+  /** 点开的消息图片（查看原图浮层） */
+  const [viewer, setViewer] = useState<Attachment | null>(null);
 
   useEffect(() => {
     ownership.current = 'following';
@@ -321,21 +326,62 @@ export default function ChatView({
       <div className="relative min-h-0 flex-1">
         <div ref={ref} onScroll={handleScroll} className="scroll-thin h-full overflow-y-auto">
           <div className="mx-auto w-full max-w-[760px] pb-10 pl-12 pr-6 pt-6">
-            {thread.messages.map((m) =>
-              m.role === 'user' ? (
+            {thread.messages.map((m) => {
+              if (m.role !== 'user') {
+                return (
+                  <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-5 scroll-mt-24">
+                    <AssistantMsg m={m} onView={onViewChanges} onToast={onToast} onLink={onOpenLink} />
+                  </div>
+                );
+              }
+              const atts = m.attachments ?? [];
+              const images = atts.filter((att) => att.kind === 'image');
+              const files = atts.filter((att) => att.kind === 'file');
+              return (
                 <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-6 flex scroll-mt-24 justify-end">
-                  <div className="group/u max-w-[78%]">
-                    <div className="whitespace-pre-wrap rounded-[20px] border border-[var(--border-strong)]/60 bg-[var(--bg-bubble)] px-4 py-3 text-[14px] leading-[24px] text-[var(--text)]">
-                      {m.content.length > 4000 ? `${m.content.slice(0, 4000)}…` : m.content}
-                    </div>
+                  <div className="group/u flex max-w-[78%] flex-col items-end">
+                    {m.steered && (
+                      <div className="mb-1 flex items-center gap-1 text-[11px] text-[var(--text-3)]">
+                        <CornerUpLeft size={11} />
+                        已插入当前任务
+                      </div>
+                    )}
+                    {images.length > 0 && (
+                      <div className={cn('flex flex-wrap justify-end gap-2', m.content && 'mb-2')}>
+                        {images.map((att) => (
+                          <AttachmentThumb
+                            key={att.id}
+                            att={att}
+                            title="点击查看原图"
+                            onClick={() => setViewer(att)}
+                            className="max-h-[240px] max-w-[280px] rounded-2xl border border-[var(--border-strong)]/60 object-contain transition-opacity hover:opacity-95"
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {files.length > 0 && m.content && (
+                      <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+                        {files.map((att) => (
+                          <span
+                            key={att.id}
+                            title={att.path || att.value}
+                            className="flex max-w-[280px] items-center gap-1.5 rounded-lg bg-[var(--bg-hover)] px-2 py-1 text-[12px]"
+                          >
+                            <FileText size={12} className="shrink-0 text-[var(--blue)]" />
+                            <span className="truncate font-mono text-[var(--blue)]">{att.path || att.value}</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {m.content && (
+                      <div className="whitespace-pre-wrap rounded-[20px] border border-[var(--border-strong)]/60 bg-[var(--bg-bubble)] px-4 py-3 text-[14px] leading-[24px] text-[var(--text)]">
+                        {m.content.length > 4000 ? `${m.content.slice(0, 4000)}…` : m.content}
+                      </div>
+                    )}
                   </div>
                 </div>
-              ) : (
-                <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-5 scroll-mt-24">
-                  <AssistantMsg m={m} onView={onViewChanges} onToast={onToast} onLink={onOpenLink} />
-                </div>
-              ),
-            )}
+              );
+            })}
           </div>
         </div>
 
@@ -354,6 +400,7 @@ export default function ChatView({
 
         <MessageNavigator key={thread.id} messages={thread.messages} activeIndex={activeIdx} onJump={jumpTo} />
       </div>
+      <ImageViewer att={viewer} onClose={() => setViewer(null)} />
     </div>
   );
 }

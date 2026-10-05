@@ -19,12 +19,14 @@ import {
   Boxes,
   Terminal,
   Cpu,
+  ShieldCheck,
+  RefreshCw,
 } from 'lucide-react';
 import type { Thread } from '../data';
 import { Toggle, Popover, MenuItem, Kbd, AppIcon } from './ui';
 import { Btn, Modal } from './kit';
-import { closeBehaviorApi, openExternal, type CloseBehavior, adminErrorMessage } from '../lib/piAdmin';
-import { isDesktopRuntime } from '../lib/piRpc';
+import { closeBehaviorApi, openExternal, updateApi, type AppUpdateCheck, type CloseBehavior, adminErrorMessage } from '../lib/piAdmin';
+import { isDesktopRuntime, fetchSecuritySnapshot, saveSecurityConfig, type SecuritySnapshot, type SecurityLevelConfig } from '../lib/piRpc';
 import { cn } from '../utils/cn';
 
 export type ThemePref = 'dark' | 'light' | 'system';
@@ -56,6 +58,20 @@ const settingsItems = [
   ['Git', GitBranch],
   ['关于', Info],
 ] as const;
+
+/** 安全等级三档卡片描述（与 Rust wepi_security::default_levels 对齐）。 */
+function securityLevelSummary(level: SecurityLevelConfig): string {
+  switch (level.id) {
+    case 'off':
+      return '完全放行';
+    case 'standard':
+      return '危险命令需确认';
+    case 'strict':
+      return '写操作确认 · 仅工作目录';
+    default:
+      return level.pathPolicy === 'unrestricted' ? '不限制目录' : '限制目录';
+  }
+}
 
 function Select({ value, options, onChange, icon }: { value: string; options: string[]; onChange: (v: string) => void; icon?: ReactNode }) {
   return (
@@ -182,6 +198,34 @@ export default function Settings({
       .catch(() => {});
   }, []);
 
+  /* 应用更新检查（GitHub Release tag）：手动触发 + 默认关闭的自动检查。
+     产品约定：不做自动化更新，发现新版本只引导用户去 release 页下载。 */
+  const [updateResult, setUpdateResult] = useState<AppUpdateCheck | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [autoCheck, setAutoCheck] = useState(() => localStorage.getItem('update-auto-check') === 'true');
+  useEffect(() => localStorage.setItem('update-auto-check', String(autoCheck)), [autoCheck]);
+  const runUpdateCheck = async (silent: boolean) => {
+    if (!isDesktopRuntime() || checking) return;
+    setChecking(true);
+    try {
+      const result = await updateApi.check();
+      setUpdateResult(result);
+      // 静默模式（启动时自动检查）：只有发现新版本才 toast，失败/已最新不打扰。
+      if (silent && result.hasUpdate && result.latestVersion) {
+        onToast(`发现新版本 v${result.latestVersion}，可在 设置 › 关于 中查看`);
+      }
+    } catch (error) {
+      if (!silent) setUpdateResult({ currentVersion: appVersion, hasUpdate: false, error: adminErrorMessage(error, '检查更新失败') });
+    } finally {
+      setChecking(false);
+    }
+  };
+  // 自动检查开启时启动静默查一次（仅一次，不做轮询）。
+  useEffect(() => {
+    if (autoCheck) void runUpdateCheck(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   /* 关闭行为（Rust 托管：窗口关闭事件在 Rust 层拦截，必须读写 Rust 侧状态） */
   const [closeBehavior, setCloseBehavior] = useState<CloseBehavior>('quit');
   useEffect(() => {
@@ -195,6 +239,40 @@ export default function Settings({
       onToast(adminErrorMessage(error, '保存关闭行为失败'));
       closeBehaviorApi.get().then((r) => setCloseBehavior(r.behavior)).catch(() => {});
     });
+  };
+
+  /* 安全管理等级（Rust 托管：wepi_security 快照；切换即写盘，扩展 mtime 热更新） */
+  const [security, setSecurity] = useState<SecuritySnapshot | null>(null);
+  /** 切到「关闭」的告警确认弹窗（danger 风格，用户确认后才真正放行全部工具）。 */
+  const [disableWarn, setDisableWarn] = useState(false);
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    fetchSecuritySnapshot().then(setSecurity).catch(() => {});
+  }, []);
+  const applySecurityLevel = (levelId: string) => {
+    if (!security) return;
+    const previous = security;
+    // 乐观更新；失败回滚。
+    setSecurity({ ...security, defaultLevelId: levelId });
+    if (!isDesktopRuntime()) return;
+    saveSecurityConfig({
+      enabled: security.enabled,
+      defaultLevelId: levelId,
+      levels: security.levels,
+      sessionOverrides: security.sessionLevels ?? {},
+    }).then(setSecurity).catch((error) => {
+      setSecurity(previous);
+      onToast(adminErrorMessage(error, '保存安全等级失败'));
+    });
+  };
+  const changeSecurityLevel = (levelId: string) => {
+    // 关闭安全门是高风险操作：弹窗告警，确认后才生效（取消保持原等级）。
+    if (levelId === 'off') {
+      setDisableWarn(true);
+      return;
+    }
+    setDisableWarn(false);
+    applySecurityLevel(levelId);
   };
 
   return (
@@ -239,21 +317,58 @@ export default function Settings({
           {page === '常规' && (
             <>
               <Section title="权限">
-                <Row title="默认权限" desc="默认情况下，Agent 可以读取和编辑其工作空间中的文件。需要时，它可以请求额外访问权限">
-                  <Toggle on={s.defaultPerm} onChange={(v) => set('defaultPerm', v)} />
-                </Row>
-                <Row
-                  title="完整访问权限"
-                  desc={
-                    <>
-                      当 Agent 以完整访问权限运行时，它无需你的批准即可编辑你电脑上的任何文件，并运行可访问网络的命令。这会显著增加数据丢失、泄露或意外行为的风险。
-                      <a className="cursor-pointer text-[var(--blue)] hover:underline">了解更多</a>关于风险升高的信息。
-                    </>
-                  }
-                >
-                  <Toggle on={s.fullAccess} onChange={(v) => set('fullAccess', v)} />
-                </Row>
+                <div className="p-4">
+                  <div className="mb-3 text-[12.5px] leading-[19px] text-[var(--text-2)]">
+                    安全等级由 WEPI 内置的安全门扩展执行：拦截危险命令、限制文件访问边界，需要确认的操作会弹出审批卡。等级切换即时生效，无需重启会话。
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    {(security?.levels ?? []).map((level) => (
+                      <button
+                        key={level.id}
+                        onClick={() => changeSecurityLevel(level.id)}
+                        disabled={!security}
+                        className={cn(
+                          'rounded-xl border-2 p-3 text-left transition-colors disabled:opacity-60',
+                          security?.defaultLevelId === level.id
+                            ? 'border-[var(--blue)] bg-[var(--bg-hover)]'
+                            : 'border-[var(--border)] hover:border-[var(--border-strong)]',
+                        )}
+                      >
+                        <div className="mb-1 flex items-center gap-2">
+                          <ShieldCheck size={14} className={level.id === 'off' ? 'text-[var(--text-3)]' : 'text-[var(--blue)]'} />
+                          <span className="text-[13.5px] font-medium text-[var(--text)]">{level.name}</span>
+                        </div>
+                        <div className="mb-1 text-[12px] font-medium text-[var(--text-2)]">{securityLevelSummary(level)}</div>
+                        <div className="text-[11.5px] leading-[17px] text-[var(--text-3)]">{level.description}</div>
+                      </button>
+                    ))}
+                    {!security && (
+                      <div className="col-span-3 py-4 text-center text-[12.5px] text-[var(--text-3)]">安全配置加载中…</div>
+                    )}
+                  </div>
+                </div>
               </Section>
+
+              {/* 关闭安全门的告警确认：与归档/删除同款 Modal 形态，danger 按钮。 */}
+              {disableWarn && (
+                <Modal title="关闭安全管理？" onClose={() => setDisableWarn(false)} width={440}>
+                  <div className="mb-5 text-[13.5px] leading-6 text-[var(--text-2)]">
+                    关闭后所有工具调用（含危险命令、敏感文件读写）将<span className="font-semibold text-[#f85149]">不再有任何拦截或确认</span>，Agent 可直接执行任意命令并访问任意文件。仅在你完全信任当前工作内容时使用。
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <Btn variant="ghost" onClick={() => setDisableWarn(false)}>取消</Btn>
+                    <Btn
+                      variant="danger"
+                      onClick={() => {
+                        setDisableWarn(false);
+                        applySecurityLevel('off');
+                      }}
+                    >
+                      我已了解风险，关闭
+                    </Btn>
+                  </div>
+                </Modal>
+              )}
               <Section title="常规">
                 <Row title="无项目任务文件夹" desc="在项目外启动的任务默认存储数据的位置。">
                   <div className="flex items-center gap-2">
@@ -535,6 +650,46 @@ export default function Settings({
                 <Row title="开源许可" desc="本项目基于 MIT 许可开源">
                   <span className="text-[12.5px] text-[var(--text-2)]">MIT</span>
                 </Row>
+              </Section>
+
+              <Section title="软件更新">
+                <Row
+                  title="检查更新"
+                  desc={
+                    updateResult?.hasUpdate
+                      ? `发现新版本 v${updateResult.latestVersion}（当前 v${updateResult.currentVersion}）`
+                      : updateResult?.error
+                        ? updateResult.error
+                        : updateResult
+                          ? '已是最新版本'
+                          : '基于 GitHub Release 标签检查；新版本需前往 Release 页手动下载'
+                  }
+                >
+                  <Btn onClick={() => void runUpdateCheck(false)} disabled={checking}>
+                    <RefreshCw size={13} className={checking ? 'animate-spin' : undefined} />
+                    {checking ? '检查中…' : '检查更新'}
+                  </Btn>
+                </Row>
+                <Row title="启动时自动检查" desc="开启后启动时静默检查一次；发现新版本时提示，不自动下载">
+                  <Toggle on={autoCheck} onChange={setAutoCheck} />
+                </Row>
+                {updateResult?.hasUpdate && updateResult.releaseUrl ? (
+                  <div className="border-t border-[var(--border)] px-4 py-3">
+                    <div className="mb-1.5 text-[12.5px] font-medium text-[var(--text)]">
+                      v{updateResult.latestVersion} 更新内容
+                    </div>
+                    {updateResult.notes ? (
+                      <pre className="scroll-thin mb-2.5 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--text-2)]">{updateResult.notes}</pre>
+                    ) : (
+                      <div className="mb-2.5 text-[12px] text-[var(--text-3)]">（Release 未附说明）</div>
+                    )}
+                    <div className="flex justify-end">
+                      <Btn variant="primary" onClick={() => openExternal(updateResult.releaseUrl!, onToast)}>
+                        <ExternalLink size={13} /> 前往下载
+                      </Btn>
+                    </div>
+                  </div>
+                ) : null}
               </Section>
 
               <Section title="链接">

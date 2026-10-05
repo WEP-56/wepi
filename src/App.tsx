@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Pencil,
   Pin,
@@ -48,8 +48,19 @@ import {
 } from './lib/piRpc';
 import { projectPiEntries, titleFromIndexEntry, type PiEntry } from './lib/piSession';
 import { applyPiEvent, createTurnState, displayContent, type PiTurnState } from './lib/piEventReducer';
+import { isExtensionUiRequest, isDialogMethod, type ExtensionUiRequest } from './lib/piRpc';
+import { isSecurityConfirm, parseTodoWidgetLines, todoItemsFromSessionEntries, TODO_WIDGET_KEY, type TodoWidgetItem } from './lib/extensionUi';
+import { DialogRequestCard, SecurityConfirmCard } from './components/ApprovalCards';
+import { TodoStrip } from './components/TodoStrip';
 import { fileTarget, workspace, type PanelTarget, type Review } from './lib/workspace';
 import { shellApi, adminErrorMessage } from './lib/piAdmin';
+import {
+  BUILTIN_COMMANDS,
+  buildCommandMap,
+  fetchPiCommands,
+  parseSlashCommand,
+  type SlashCommand,
+} from './lib/slashCommands';
 import type { UsageSnapshot } from './components/ContextUsage';
 import {
   efforts,
@@ -60,7 +71,11 @@ import {
   type Project,
   type Provider,
   type Message,
+  type Attachment,
+  type ComposerDraft,
+  type PendingSend,
 } from './data';
+import { attachmentFromPath, attachmentPromptBlock, ensureAttachmentPaths, forPersistence } from './lib/attachments';
 
 interface NavState {
   view: ViewId;
@@ -118,6 +133,23 @@ function loadStore(): PersistedStore {
   }
 }
 
+/* ---------- 草稿：输入框内容按会话保存，切换页面/会话/重启都不丢 ---------- */
+const DRAFT_KEY = 'wepi-composer-drafts';
+const EMPTY_DRAFT: ComposerDraft = { text: '', attachments: [] };
+
+function loadDrafts(): Record<string, ComposerDraft> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? '{}') as Record<string, ComposerDraft>;
+    if (!parsed || typeof parsed !== 'object') return {};
+    return Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, {
+      text: typeof value?.text === 'string' ? value.text : '',
+      attachments: Array.isArray(value?.attachments) ? value.attachments : [],
+    }]));
+  } catch {
+    return {};
+  }
+}
+
 function usePersistedStore() {
   const [store, setStore] = useState<PersistedStore>(loadStore);
   const saveTimer = useRef<number>(0);
@@ -134,11 +166,20 @@ function usePersistedStore() {
     mutate((s) => ({ ...s, expanded: typeof updater === 'function' ? updater(s.expanded) : updater }));
   }, [mutate]);
   // 防抖持久化：会话内容高频更新（流式 delta）时不逐次写盘。
+  // 图片附件的 data URL 在落盘前剥离（配额极有限，失败还是静默的），保留 path 以便重新读取。
   const persist = useCallback((next: PersistedStore) => {
     window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
       try {
-        localStorage.setItem(STORE_KEY, JSON.stringify(next));
+        const lean: PersistedStore = {
+          ...next,
+          threads: next.threads.map((thread) => (
+            thread.messages.some((m) => m.attachments?.length)
+              ? { ...thread, messages: thread.messages.map((m) => (m.attachments?.length ? { ...m, attachments: forPersistence(m.attachments) } : m)) }
+              : thread
+          )),
+        };
+        localStorage.setItem(STORE_KEY, JSON.stringify(lean));
       } catch { /* 配额超限时静默失败 */ }
     }, 400);
   }, []);
@@ -181,12 +222,18 @@ export default function App() {
   });
   const [menu, setMenu] = useState<{ x: number; y: number; items: CtxItem[] } | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
+  const [drafts, setDrafts] = useState<Record<string, ComposerDraft>>(loadDrafts);
+  /** 原生拖拽悬停中：桌面端窗口级拖拽不产生 DOM 事件，需要自己的落区提示 */
+  const [dropActive, setDropActive] = useState(false);
   const [piModels, setPiModels] = useState<{ id: string; name: string; provider: string }[]>([]);
   const [piEfforts, setPiEfforts] = useState<readonly (typeof efforts)[number][]>(efforts);
   const [usage, setUsage] = useState<UsageSnapshot>({ contextPercent: 0, contextTokens: 0, contextWindow: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, totalCost: 0 });
   const [piConfigReady, setPiConfigReady] = useState(false);
   /** 系统打开能力（VS Code 是否可用等）；桌面启动时探测一次 */
   const [shellCapabilities, setShellCapabilities] = useState({ vscode: false });
+  /** 斜杠命令目录：内置 + 当前会话 RPC 进程上报（get_commands） */
+  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>(BUILTIN_COMMANDS);
+  const slashCommandsLoaded = useRef(false);
 
   const timers = useRef<Record<string, number[]>>({});
   const toastTimer = useRef<number>(0);
@@ -200,6 +247,31 @@ export default function App() {
   const piModelsConfig = useRef<Record<string, Record<string, unknown>>>({});
   /** 会话打开请求的代际号，防止旧请求覆盖新导航 */
   const openGeneration = useRef(0);
+  /**
+   * 任务进行中排队待发消息（按会话键分组）：默认等当前回合结束自动发送。
+   * 事件回调用 ref 读最新值，避免闭包过期。
+   */
+  const [pendingSends, setPendingSends] = useState<Record<string, PendingSend[]>>({});
+  const pendingRef = useRef(pendingSends);
+  pendingRef.current = pendingSends;
+
+  /* ---------- Extension UI：待响应对话请求 + todo widget（按会话键） ---------- */
+  /** 每个会话至多一张待响应卡：扩展的 dialog 方法在 pi 侧阻塞等待。 */
+  const [uiRequests, setUiRequests] = useState<Record<string, ExtensionUiRequest>>({});
+  const [todoBySession, setTodoBySession] = useState<Record<string, TodoWidgetItem[]>>({});
+  /** 历史会话（无活 runtime）的 todo 兜底：按 threadId 索引。 */
+  const [todoByThread, setTodoByThread] = useState<Record<string, TodoWidgetItem[]>>({});
+
+  /** 按 id 精确移除待响应卡：只清这张请求，不影响后来顶替登记的新请求。 */
+  const clearUiRequest = useCallback((sessionKey: string, requestId: string) => {
+    setUiRequests((current) => {
+      const existing = current[sessionKey];
+      if (!existing || existing.id !== requestId) return current;
+      const next = { ...current };
+      delete next[sessionKey];
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -412,6 +484,90 @@ export default function App() {
   const busy = !!activeThread?.messages.some((m) => m.streaming || m.thinking);
   const modelOptions = piModels.length ? piModels.map((model) => ({ id: `${model.provider}:${model.id}`, name: model.name || model.id, provider: model.provider })) : buildModelOptions(providers);
 
+  /* ---------- 输入框草稿：按会话保存，导航离开再回来内容仍在 ---------- */
+  const draftKey = activeThread?.id ?? 'new';
+  const draft = drafts[draftKey] ?? EMPTY_DRAFT;
+  const setDraft = useCallback((updater: ComposerDraft | ((prev: ComposerDraft) => ComposerDraft)) => {
+    setDrafts((all) => {
+      const current = all[draftKey] ?? EMPTY_DRAFT;
+      const next = typeof updater === 'function' ? updater(current) : updater;
+      return { ...all, [draftKey]: next };
+    });
+  }, [draftKey]);
+  /** 事件订阅只注册一次，用 ref 读取「当前草稿键」避免闭包过期。 */
+  const draftKeyRef = useRef(draftKey);
+  draftKeyRef.current = draftKey;
+  const viewRef = useRef(nav.view);
+  viewRef.current = nav.view;
+
+  const appendToDraft = useCallback((list: Attachment[]) => {
+    if (!list.length) return;
+    const key = draftKeyRef.current;
+    setDrafts((all) => {
+      const current = all[key] ?? EMPTY_DRAFT;
+      return { ...all, [key]: { ...current, attachments: [...current.attachments, ...list] } };
+    });
+  }, []);
+
+  const clearDraft = useCallback((key: string) => {
+    setDrafts((all) => {
+      if (!(key in all)) return all;
+      const next = { ...all };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
+  // 草稿落盘：图片 data URL 先剥离（配额有限），纯空草稿不写。
+  useEffect(() => {
+    const lean = Object.fromEntries(
+      Object.entries(drafts)
+        .filter(([, value]) => value.text.trim() || value.attachments.length)
+        .map(([key, value]) => [key, { ...value, attachments: forPersistence(value.attachments) }]),
+    );
+    try {
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(lean));
+    } catch { /* 配额超限时静默失败 */ }
+  }, [drafts]);
+
+  /**
+   * 桌面端原生拖拽：WebView2 的 dragDropEnabled 默认开启，文件拖入不会产生 DOM 事件，
+   * 只有窗口级 onDragDropEvent 能拿到真实绝对路径（浏览器端由 Composer 的 DOM 事件兜底）。
+   */
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void (async () => {
+      try {
+        const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+        const off = await getCurrentWebview().onDragDropEvent((event) => {
+          const payload = event.payload;
+          if (payload.type === 'enter' || payload.type === 'over') {
+            if (viewRef.current === 'home') setDropActive(true);
+            return;
+          }
+          if (payload.type === 'leave') {
+            setDropActive(false);
+            return;
+          }
+          if (payload.type !== 'drop') return;
+          setDropActive(false);
+          if (viewRef.current !== 'home') return;
+          const paths = payload.paths ?? [];
+          if (!paths.length) return;
+          void Promise.all(paths.map(attachmentFromPath)).then(appendToDraft);
+        });
+        if (disposed) off();
+        else unlisten = off;
+      } catch { /* 旧运行时没有该 API：静默降级为不做原生拖拽 */ }
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [appendToDraft]);
+
   const navigate = (v: ViewId) => go({ view: v, threadId: v === 'home' ? lastHome.current : null });
   const newChat = () => go({ view: 'home', threadId: null });
   const newChatIn = (pid: string | null) => {
@@ -452,6 +608,14 @@ export default function App() {
     void readPiSession(thread.piSessionPath).then((entries) => {
       if (openGeneration.current !== generation) return;
       const messages = projectPiEntries(entries as unknown as PiEntry[]);
+      // 历史会话的 todo 兜底：无活 runtime 时从 custom 快照条目重建。
+      const todos = todoItemsFromSessionEntries(entries);
+      if (todos.length) setTodoByThread((current) => ({ ...current, [id]: todos }));
+      else setTodoByThread((current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
       setThreads((ts) => ts.map((t) => (t.id === id && !t.messages.some((m) => m.streaming || m.thinking)
         ? { ...t, messages, piFileSize: undefined }
         : t)));
@@ -484,6 +648,11 @@ export default function App() {
   const deleteThread = (id: string) => {
     const thread = threads.find((t) => t.id === id);
     setThreads((ts) => ts.filter((t) => t.id !== id));
+    // 会话没了：排队消息一并丢弃（否则冲刷会对着不存在的 thread 开回合）。
+    if ((pendingRef.current[id] ?? []).length) {
+      pendingRef.current = { ...pendingRef.current, [id]: [] };
+      setPendingSends((all) => ({ ...all, [id]: [] }));
+    }
     if (nav.threadId === id) setNav({ view: 'home', threadId: null });
     if (!isDesktopRuntime() || !thread?.piSessionPath) {
       showToast('已永久删除聊天');
@@ -712,6 +881,26 @@ export default function App() {
     },
   ];
 
+  /* ---------- 斜杠命令 ---------- */
+  /**
+   * 输入框触发 `/` 时拉取 pi 的命令目录（扩展 / 提示词 / 技能）。
+   * 每次应用运行只拉一次；命令集在进程生命周期内基本不变，重复拉取
+   * 只会增加 RPC 往返。失败允许下次触发重试。
+   */
+  const loadSlashCommands = useCallback((rpcKey?: string) => {
+    if (!isDesktopRuntime() || slashCommandsLoaded.current) return;
+    const key = rpcKey && rpcKey !== 'default' ? rpcKey : undefined;
+    // 没有 RPC 会话键时不拉（发给不存在进程的请求只会超时）。
+    if (!key) return;
+    slashCommandsLoaded.current = true;
+    void fetchPiCommands(key).then((commands) => {
+      if (commands.length) setSlashCommands([...BUILTIN_COMMANDS, ...commands]);
+      else slashCommandsLoaded.current = false; // 允许下次重试
+    });
+  }, []);
+
+  const commandMap = useMemo(() => buildCommandMap(slashCommands), [slashCommands]);
+
   /* ---------- 对话 ---------- */
   const updateMsg = (tid: string, mid: string, patch: (m: Message) => Partial<Message>) =>
     setThreads((ts) =>
@@ -750,6 +939,8 @@ export default function App() {
       const tokens = result.tokens ?? {};
       setUsage({ contextPercent: context.percent ?? 0, contextTokens: context.tokens ?? 0, contextWindow: context.contextWindow ?? 0, inputTokens: tokens.input ?? 0, outputTokens: tokens.output ?? 0, cacheReadTokens: tokens.cacheRead ?? 0, totalCost: result.cost ?? 0 });
     } catch { /* Stats are optional until the first completed turn. */ }
+    // RPC 进程刚就绪——补拉一次斜杠命令目录（新会话首次发送后 / 菜单才有 pi 命令）。
+    loadSlashCommands(rpcKey);
   };
 
   /* ---------- Pi RPC 事件 → 聊天区域渲染状态机 ---------- */
@@ -759,8 +950,41 @@ export default function App() {
       event: (record) => {
         // 按来源会话键路由：允许多个会话同时运行（切走再发消息不会串台）。
         const sessionKey = typeof record.__sessionKey === 'string' ? record.__sessionKey : undefined;
+        // Extension UI 子协议：pi 扩展的对话/挂件请求，与回合状态机无关，
+        // 必须在 run 判空之前处理（审批可能在回合间隙到达）。
+        if (isExtensionUiRequest(record)) {
+          const request = record as ExtensionUiRequest;
+          const key = request.__sessionKey ?? sessionKey ?? 'default';
+          if (request.method === 'setWidget' && request.widgetKey === TODO_WIDGET_KEY) {
+            // todo 挂件：fire-and-forget，解析行快照更新会话 todo 状态。
+            const items = parseTodoWidgetLines(request.widgetLines);
+            setTodoBySession((current) => ({ ...current, [key]: items }));
+          } else if (request.method === 'setWidget' && (!request.widgetLines || request.widgetLines.length === 0)) {
+            // 清空挂件（widgetLines 为空 = 移除）：todo 条随之隐藏。
+            if (request.widgetKey === TODO_WIDGET_KEY) {
+              setTodoBySession((current) => {
+                const next = { ...current };
+                delete next[key];
+                return next;
+              });
+            }
+          } else if (isDialogMethod(request)) {
+            // 对话方法：登记待响应卡（同会话新请求顶替旧卡；旧的按 cancelled 兜底）。
+            setUiRequests((current) => ({ ...current, [key]: request }));
+          }
+          return;
+        }
         const run = sessionKey ? piRuns.current.get(sessionKey) : undefined;
         if (!run) return;
+        // 引导消息被 Pi 正式消费（user_message_start）：去掉「已插入」角标，
+        // 它已是回合的一部分。按文本前缀匹配——附件提示块会拼在原文之后
+        // （pilo 的 acknowledgeQueuedMessage 同款按文本对账）。
+        if (record.type === 'user_message_start' && typeof record.text === 'string') {
+          const ackText = record.text;
+          setThreads((ts) => ts.map((thread) => (thread.id === run.threadId && thread.messages.some((m) => m.steered && ackText.startsWith(m.content))
+            ? { ...thread, messages: thread.messages.map((m) => (m.steered && ackText.startsWith(m.content) ? { ...m, steered: undefined } : m)) }
+            : thread)));
+        }
         // 回合状态由纯函数归约器推进，事件处理不再直接改 ref。
         const next = applyPiEvent(run.state, record, Date.now());
         if (next !== run.state) {
@@ -774,26 +998,43 @@ export default function App() {
         }
         if (record.type === 'agent_settled' && next.finished) {
           const turnId = run.turnId;
+          const settledThreadId = run.threadId;
+          const settledRpcKey = run.rpcKey;
+          // 回合结束：残留的「已插入」角标一并清掉——引导消息这时必然
+          // 已被 Pi 消费或随回合终止，保留角标只会误导。
+          setThreads((ts) => ts.map((thread) => (thread.id === settledThreadId && thread.messages.some((m) => m.steered)
+            ? { ...thread, messages: thread.messages.map((m) => (m.steered ? { ...m, steered: undefined } : m)) }
+            : thread)));
           void workspace<Review & { id: string }>('turn_end', run.cwd ?? '', { id: turnId }).then((review) => {
             const edits = review.files.map((file) => ({ file: file.file, add: file.add, del: file.del }));
-            setThreads((ts) => ts.map((thread) => thread.id === run.threadId ? { ...thread, lastTurnId: review.id, messages: thread.messages.map((message) => message.id === run.messageId ? { ...message, edits: edits.length ? edits : undefined } : message) } : thread));
+            setThreads((ts) => ts.map((thread) => thread.id === settledThreadId ? { ...thread, lastTurnId: review.id, messages: thread.messages.map((message) => message.id === run.messageId ? { ...message, edits: edits.length ? edits : undefined } : message) } : thread));
           }).catch(() => {});
-          if (navRef.current.threadId !== run.threadId || navRef.current.view !== 'home')
-            setThreads((ts) => ts.map((thread) => thread.id === run.threadId ? { ...thread, unread: true } : thread));
-          piRuns.current.delete(run.rpcKey);
-          void requestPiRpc<{ sessionFile?: string; contextUsage?: { tokens?: number | null; contextWindow?: number; percent?: number | null }; tokens?: { input?: number; output?: number; cacheRead?: number }; cost?: number }>({ type: 'get_session_stats' }, 10_000, run.rpcKey).then((stats) => {
+          if (navRef.current.threadId !== settledThreadId || navRef.current.view !== 'home')
+            setThreads((ts) => ts.map((thread) => thread.id === settledThreadId ? { ...thread, unread: true } : thread));
+          piRuns.current.delete(settledRpcKey);
+          void requestPiRpc<{ sessionFile?: string; contextUsage?: { tokens?: number | null; contextWindow?: number; percent?: number | null }; tokens?: { input?: number; output?: number; cacheRead?: number }; cost?: number }>({ type: 'get_session_stats' }, 10_000, settledRpcKey).then((stats) => {
             const context = stats.contextUsage ?? {};
             const tokens = stats.tokens ?? {};
             setUsage({ contextPercent: context.percent ?? 0, contextTokens: context.tokens ?? 0, contextWindow: context.contextWindow ?? 0, inputTokens: tokens.input ?? 0, outputTokens: tokens.output ?? 0, cacheReadTokens: tokens.cacheRead ?? 0, totalCost: stats.cost ?? 0 });
             if (stats.sessionFile) {
-              setThreads((ts) => ts.map((thread) => (thread.id === run.threadId && !thread.piSessionPath ? { ...thread, piSessionPath: stats.sessionFile } : thread)));
+              setThreads((ts) => ts.map((thread) => (thread.id === settledThreadId && !thread.piSessionPath ? { ...thread, piSessionPath: stats.sessionFile } : thread)));
             }
           }).catch(() => {});
+          // 回合自然结束：冲刷该会话的排队消息（FIFO，逐条作为新回合发送）。
+          flushPending(settledThreadId);
         }
       },
       error: (message) => showToast(message),
       exit: (sessionKey) => {
         const run = sessionKey ? piRuns.current.get(sessionKey) : undefined;
+        // 进程退出：待响应卡与 todo 挂件随会话清理（pi 侧阻塞已被进程终止解除）。
+        if (sessionKey) {
+          setUiRequests((current) => {
+            const next = { ...current };
+            delete next[sessionKey];
+            return next;
+          });
+        }
         if (!run) return;
         piRuns.current.delete(run.rpcKey);
         updateMsg(run.threadId, run.messageId, (message) => ({
@@ -805,37 +1046,99 @@ export default function App() {
     return () => { dispose?.(); void stopPiRpc(); };
   }, [showToast]);
 
-  const send = (text: string) => {
+  const send = (text: string, attachments: Attachment[] = []) => {
     let tid = activeThread?.id;
-    const userMsg: Message = { id: uid(), role: 'user', content: text };
+    const sourceDraftKey = tid ?? 'new';
+    /* 斜杠命令：桌面接管的命令不进会话、不发给模型。
+     * 判定依赖命令目录（commandMap）：未加载目录时目录中不存在该名字，
+     * 会按普通文本发送——与「未知命令原样发文本」的兜底一致。 */
+    const parsed = parseSlashCommand(text, commandMap);
+    if (parsed.kind === 'builtin' && parsed.name === 'new') {
+      clearDraft(sourceDraftKey);
+      newChat();
+      return;
+    }
+    if (parsed.kind === 'builtin' && parsed.name === 'compact') {
+      if (busy) { showToast('等待当前回合结束后再压缩'); return; }
+      const rpcKey = activeThread?.rpcKey;
+      if (!isDesktopRuntime()) { showToast('压缩仅桌面端可用'); return; }
+      if (!tid || !rpcKey) { showToast('请先开始一段对话再压缩上下文'); return; }
+      const cwd = activeThread?.piCwd ?? project?.path ?? null;
+      const sessionPath = activeThread?.piSessionPath ?? null;
+      clearDraft(sourceDraftKey);
+      void (async () => {
+        showToast('正在压缩上下文…');
+        try {
+          const handshake = await ensurePiSession({ sessionKey: rpcKey, cwd, sessionPath });
+          if (handshake?.sessionFile && !activeThread?.piSessionPath) {
+            setThreads((ts) => ts.map((t) => (t.id === tid ? { ...t, piSessionPath: handshake.sessionFile ?? null } : t)));
+          }
+          await requestPiRpc(
+            parsed.rest ? { type: 'compact', customInstructions: parsed.rest } : { type: 'compact' },
+            120_000,
+            rpcKey,
+          );
+          showToast('上下文已压缩');
+        } catch (error: unknown) {
+          showToast(`压缩失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      })();
+      return;
+    }
+    /* 任务进行中 → 排队：消息进悬浮栏，等当前回合结束自动发送。
+     * 悬浮栏里可「引导」（立即插入当前回合）或「撤回」（放回输入框）。 */
+    if (busy && tid) {
+      addToQueue(tid, { id: uid(), text, attachments });
+      clearDraft(sourceDraftKey);
+      return;
+    }
+    // 空闲且已有会话：直接开回合。新会话先建 thread 再发。
+    if (tid) {
+      clearDraft(sourceDraftKey);
+      runTurn(text, attachments, tid);
+      return;
+    }
+    const newTid = uid();
+    const newThreadCwd = projects.find((p) => p.id === selectedProject)?.path ?? null;
+    const seed: Thread = {
+      id: newTid,
+      title: (text.split('\n')[0].trim() || attachments[0]?.name || '新会话').slice(0, 24),
+      projectId: selectedProject,
+      messages: [],
+      piCwd: newThreadCwd,
+    };
+    go({ view: 'home', threadId: newTid });
+    expand(selectedProject);
+    clearDraft('new');
+    runTurn(text, attachments, newTid, seed);
+  };
+  /**
+   * 发起一个新回合（普通发送与排队冲刷共用）。
+   * 乐观写入用户消息 + 助手占位，再走 RPC 启动/复用与模型同步流程。
+   * `seed`：新会话首条消息时传入完整 Thread（state 里还没有它），
+   * 追加消息时直接用，避免依赖尚未提交的 state。
+   */
+  const runTurn = (text: string, attachments: Attachment[], tid: string, seed?: Thread) => {
+    const userMsg: Message = {
+      id: uid(),
+      role: 'user',
+      content: text,
+      attachments: attachments.length ? attachments : undefined,
+    };
     const aid = uid();
     const placeholder: Message = { id: aid, role: 'assistant', content: '', blocks: [], streaming: true };
-    // 新会话的工作目录取自所选项目——Pi 会话按 cwd 归档，必须一开始就绑定。
-    const newThreadCwd = projects.find((p) => p.id === selectedProject)?.path ?? null;
-    if (!tid) {
-      tid = uid();
-      const t: Thread = {
-        id: tid,
-        title: text.split('\n')[0].slice(0, 24),
-        projectId: selectedProject,
-        messages: [userMsg, placeholder],
-        piCwd: newThreadCwd,
-      };
-      setThreads((ts) => [t, ...ts]);
-      expand(selectedProject);
-      go({ view: 'home', threadId: tid });
-    } else {
-      const id = tid;
-      setThreads((ts) => {
-        const cur = ts.find((t) => t.id === id);
-        if (!cur) return ts;
-        return [{ ...cur, messages: [...cur.messages, userMsg, placeholder] }, ...ts.filter((t) => t.id !== id)];
-      });
-    }
+    setThreads((ts) => {
+      if (seed && !ts.some((t) => t.id === seed.id)) {
+        return [{ ...seed, messages: [userMsg, placeholder] }, ...ts];
+      }
+      const cur = ts.find((t) => t.id === tid);
+      if (!cur) return ts;
+      return [{ ...cur, messages: [...cur.messages, userMsg, placeholder] }, ...ts.filter((t) => t.id !== tid)];
+    });
     if (isDesktopRuntime()) {
       const rpcThreadId = tid;
       const runStartedAt = Date.now();
-      const current = threads.find((t) => t.id === rpcThreadId);
+      const current = seed ?? threads.find((t) => t.id === rpcThreadId);
       const rpcKey = current?.rpcKey ?? `rpc-${rpcThreadId}`;
       const workingDirectory = current?.piCwd ?? project?.path ?? null;
       const sessionPath = current?.piSessionPath ?? null;
@@ -879,9 +1182,17 @@ export default function App() {
         } catch {
           // 旧版 Pi 可能缺少其中某个命令，不影响本轮对话。
         }
+        // 粘贴的图片没有磁盘来源，先落盘到临时目录再拼提示词——
+        // 只有路径能让 Pi 真正读到图片；顺带把路径回写到消息里，重启后仍可查看。
+        const ready = attachments.length ? await ensureAttachmentPaths(attachments) : [];
+        if (ready.length && ready.some((att, i) => att.path !== attachments[i].path)) {
+          setThreads((ts) => ts.map((t) => (t.id === rpcThreadId
+            ? { ...t, messages: t.messages.map((m) => (m.id === userMsg.id ? { ...m, attachments: ready } : m)) }
+            : t)));
+        }
         // prompt 用 request 发送：Pi 接受后即返回，被拒绝时错误能落到调用方，
         // 而不是混进助手正文。
-        await requestPiRpc({ type: 'prompt', message: text }, 30_000, rpcKey);
+        await requestPiRpc({ type: 'prompt', message: text + attachmentPromptBlock(ready) }, 30_000, rpcKey);
         await refreshPiCatalog(rpcKey);
       })().catch((error: unknown) => {
         piRuns.current.delete(rpcKey);
@@ -892,6 +1203,98 @@ export default function App() {
       return;
     }
     runDemoReply(tid, aid);
+  };
+
+  /* ---------- 排队消息：引导 / 撤回 / 回合结束冲刷 ---------- */
+
+  /** runTurn 的最新引用：事件订阅 effect 的闭包里不能用过期渲染的版本。 */
+  const runTurnRef = useRef(runTurn);
+  runTurnRef.current = runTurn;
+
+  /**
+   * 引导：把排队消息立即插入当前回合（pi steer 语义）。
+   * 从悬浮栏移除、写入会话并打「已插入」角标；失败回滚到排队栏。
+   */
+  const steerNow = (item: PendingSend) => {
+    const tid = activeThread?.id;
+    if (!tid || !isDesktopRuntime()) return;
+    const thread = threads.find((t) => t.id === tid);
+    const rpcKey = thread?.rpcKey;
+    if (!rpcKey) { showToast('当前任务尚未就绪，请稍候'); return; }
+    removeFromQueue(tid, item.id);
+    const steerMsg: Message = {
+      id: uid(),
+      role: 'user',
+      content: item.text,
+      attachments: item.attachments.length ? item.attachments : undefined,
+      steered: true,
+    };
+    setThreads((ts) => {
+      const cur = ts.find((t) => t.id === tid);
+      if (!cur) return ts;
+      // 插在仍在流式的助手占位之前：用户补充发生在回合中途，视觉顺序
+      // 与时间线一致（占位继续在它下方流式演进）。
+      const streamingIndex = (() => {
+        for (let i = cur.messages.length - 1; i >= 0; i -= 1) {
+          if (cur.messages[i].streaming || cur.messages[i].thinking) return i;
+        }
+        return cur.messages.length;
+      })();
+      const messages = [...cur.messages.slice(0, streamingIndex), steerMsg, ...cur.messages.slice(streamingIndex)];
+      return [{ ...cur, messages }, ...ts.filter((t) => t.id !== tid)];
+    });
+    void (async () => {
+      try {
+        const ready = item.attachments.length ? await ensureAttachmentPaths(item.attachments) : [];
+        if (ready.length && ready.some((att, i) => att.path !== item.attachments[i].path)) {
+          setThreads((ts) => ts.map((t) => (t.id === tid
+            ? { ...t, messages: t.messages.map((m) => (m.id === steerMsg.id ? { ...m, attachments: ready } : m)) }
+            : t)));
+        }
+        await requestPiRpc({ type: 'steer', message: item.text + attachmentPromptBlock(ready) }, 30_000, rpcKey);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        showToast(`引导失败：${message}`);
+        // 失败回滚：移除乐观消息，内容回到排队栏。
+        setThreads((ts) => ts.map((t) => (t.id === tid ? { ...t, messages: t.messages.filter((m) => m.id !== steerMsg.id) } : t)));
+        addToQueue(tid, item);
+      }
+    })();
+  };
+
+  /** 从排队栏移除一条（同步更新 ref，防止事件回调读到过期队列）。 */
+  const removeFromQueue = (tid: string, itemId: string) => {
+    pendingRef.current = { ...pendingRef.current, [tid]: (pendingRef.current[tid] ?? []).filter((x) => x.id !== itemId) };
+    setPendingSends((all) => ({ ...all, [tid]: (all[tid] ?? []).filter((x) => x.id !== itemId) }));
+  };
+
+  /** 追加一条到排队栏尾部（同步更新 ref）。 */
+  const addToQueue = (tid: string, item: PendingSend) => {
+    pendingRef.current = { ...pendingRef.current, [tid]: [...(pendingRef.current[tid] ?? []), item] };
+    setPendingSends((all) => ({ ...all, [tid]: [...(all[tid] ?? []), item] }));
+  };
+
+  /** 撤回：把排队消息放回输入框草稿（追加，不覆盖已有内容）。 */
+  const withdrawPending = (item: PendingSend) => {
+    const key = activeThread?.id ?? 'new';
+    removeFromQueue(key, item.id);
+    setDrafts((all) => {
+      const current = all[key] ?? EMPTY_DRAFT;
+      const text = current.text.trim() ? `${current.text}\n${item.text}` : item.text;
+      return { ...all, [key]: { text, attachments: [...current.attachments, ...item.attachments] } };
+    });
+  };
+
+  /** 回合结束冲刷：FIFO 取出队首作为新回合发送；仍忙碌则留待下次。 */
+  const flushPending = (tid: string) => {
+    const queue = pendingRef.current[tid] ?? [];
+    if (!queue.length) return;
+    const [first, ...rest] = queue;
+    pendingRef.current = { ...pendingRef.current, [tid]: rest };
+    setPendingSends((all) => ({ ...all, [tid]: rest }));
+    // runTurn 依赖渲染期 state（threads/composer/project），用 ref 取最新实现，
+    // 避免事件订阅 effect 闭包里的过期版本。
+    window.setTimeout(() => runTurnRef.current(first.text, first.attachments, tid), 120);
   };
 
   const runDemoReply = (id: string, aid: string) => {
@@ -914,13 +1317,15 @@ export default function App() {
           if (navRef.current.threadId !== id || navRef.current.view !== 'home')
             setThreads((ts) => ts.map((t) => (t.id === id ? { ...t, unread: true } : t)));
           delete timers.current[id];
+          // 演示模式回合结束：同样冲刷排队消息。
+          flushPending(id);
         } else {
           updateMsg(id, aid, () => ({ content: reply.content.slice(0, i) }));
         }
       }, 22);
       timers.current[id] = [...(timers.current[id] || []), iv];
     }, 1400);
-    timers.current[id] = [t1];
+    timers.current[id] = [...(timers.current[id] || []), t1];
   };
 
   const stop = () => {
@@ -937,6 +1342,19 @@ export default function App() {
         piRuns.current.delete(run.rpcKey);
         void sendPiRpc({ type: 'abort' }, run.rpcKey).catch(() => {});
       }
+    }
+    // 停止 = 用户要中断这个会话的运行：排队消息一并撤回草稿（pilo 的
+    // releaseActiveTurn 同款），否则 abort 触发的 settled 会立刻把它们发出。
+    // 注意同步清 ref：settled 事件比下一次渲染先到，只清 state 会漏。
+    const queued = pendingRef.current[id] ?? [];
+    if (queued.length) {
+      pendingRef.current = { ...pendingRef.current, [id]: [] };
+      setPendingSends((all) => ({ ...all, [id]: [] }));
+      setDrafts((all) => {
+        const current = all[id] ?? EMPTY_DRAFT;
+        const text = [...queued.map((q) => q.text), current.text.trim()].filter(Boolean).join('\n');
+        return { ...all, [id]: { text, attachments: [...current.attachments, ...queued.flatMap((q) => q.attachments)] } };
+      });
     }
     setThreads((ts) =>
       ts.map((t) =>
@@ -1138,6 +1556,29 @@ export default function App() {
                     <EmptyState project={project} rightOpen={rightOpen} onToggleRight={() => setRightOpen((o) => !o)} />
                   )}
                   <div className="mx-auto w-full max-w-[760px] px-4 pb-4">
+                    {/* Extension UI 待响应卡：pi 扩展的对话请求（安全审批 / ask）阻塞等待用户。
+                        响应/超时/取消后经 onSettled 从登记表移除卡片。
+                        key/id 先提取为局部 const：闭包捕获稳定值，不随 activeThread 变化。 */}
+                    {(() => {
+                      const rpcKey = activeThread?.rpcKey;
+                      const pending = rpcKey ? uiRequests[rpcKey] : undefined;
+                      if (!rpcKey || !pending) return null;
+                      const settle = () => clearUiRequest(rpcKey, pending.id);
+                      return isSecurityConfirm(pending) ? (
+                        <SecurityConfirmCard request={pending} sessionKey={rpcKey} onSettled={settle} />
+                      ) : (
+                        <DialogRequestCard request={pending} sessionKey={rpcKey} onSettled={settle} />
+                      );
+                    })()}
+                    {/* Todo 常驻条：活会话来自 widget 行快照；历史会话从会话文件兜底。
+                        全部完成时组件内部自行隐藏（数据保留在会话侧）。 */}
+                    {(() => {
+                      const key = activeThread?.rpcKey;
+                      const live = key ? todoBySession[key] : undefined;
+                      if (live && live.length > 0) return <TodoStrip items={live} />;
+                      const fallback = activeThread ? todoByThread[activeThread.id] : undefined;
+                      return fallback ? <TodoStrip items={fallback} /> : null;
+                    })()}
                     <Composer
                       project={project}
                       projects={projects}
@@ -1148,11 +1589,22 @@ export default function App() {
                       onSettings={setComposer}
                       modelOptions={modelOptions}
                       effortOptions={piEfforts}
+                      draft={draft}
+                      onDraft={setDraft}
                       onSend={send}
                       busy={busy}
                       onStop={stop}
                       onToast={showToast}
                       usage={usage}
+                      commands={slashCommands}
+                      onSlashTrigger={(trigger) => {
+                        if (trigger) loadSlashCommands(activeThread?.rpcKey ?? undefined);
+                      }}
+                      queue={activeThread ? pendingSends[activeThread.id] ?? [] : []}
+                      onQueueItem={(item, action) => {
+                        if (action === 'steer') steerNow(item);
+                        else withdrawPending(item);
+                      }}
                     />
                   </div>
                 </div>
@@ -1175,6 +1627,15 @@ export default function App() {
       </div>
 
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={closeMenu} />}
+
+      {/* 原生拖拽落区提示：文件进入窗口即提示，松手后并入当前会话草稿 */}
+      {dropActive && nav.view === 'home' && (
+        <div className="pointer-events-none fixed inset-0 z-[120] flex items-center justify-center bg-black/40">
+          <div className="rounded-2xl border border-dashed border-[var(--blue)] bg-[var(--bg-elev)] px-6 py-4 text-[14px] text-[var(--text)] shadow-2xl shadow-black/40">
+            松开以添加图片或文件
+          </div>
+        </div>
+      )}
 
       {dialog?.kind === 'project' && (
         <ProjectDialog

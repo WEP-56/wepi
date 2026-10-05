@@ -669,10 +669,22 @@ function DiffView({ root, tab }: { root: string; tab: Tab }) {
 /* 终端                                                                */
 /* ------------------------------------------------------------------ */
 
-function TerminalView({ root, id }: { root: string; id: string }) {
+/**
+ * 终端视图：xterm 实例与 PTY 进程都按 tab id 常驻。
+ *
+ * 状态保持的关键：
+ * - xterm Terminal 只创建一次（effect 依赖 id），组件实例随标签页常驻；
+ *   切换标签页只是宿主容器 display:none / 恢复，滚动回溯与正在运行的
+ *   进程都不受影响。
+ * - PTY 进程的生命周期由标签页控制：关闭标签页（组件卸载）才
+ *   terminal_close；切到其它标签页进程继续跑，输出照常写入 xterm 缓冲。
+ */
+function TerminalView({ root, id, active }: { root: string; id: string; active: boolean }) {
   const node = useRef<HTMLDivElement>(null);
   const [running, setRunning] = useState(true);
   const [error, setError] = useState('');
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
 
   useEffect(() => {
     const host = node.current;
@@ -686,11 +698,14 @@ function TerminalView({ root, id }: { root: string; id: string }) {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(host);
+    terminalRef.current = terminal;
+    fitRef.current = fit;
 
     let frame = 0;
     let started = false;
     const measure = () => {
       frame = 0;
+      if (!host.isConnected || host.clientWidth <= 0) return;
       try {
         fit.fit();
       } catch {
@@ -735,9 +750,32 @@ function TerminalView({ root, id }: { root: string; id: string }) {
       data.dispose();
       observer.disconnect();
       terminal.dispose();
+      terminalRef.current = null;
+      fitRef.current = null;
+      // 只有标签页真正关闭（组件卸载）才杀掉 PTY 进程。
       void invoke('terminal_close', { id }).catch(() => {});
     };
   }, [id, root]);
+
+  // 重新可见时复位尺寸：display:none 期间 xterm 的内部行列会落后于
+  // 实际容器（fit 对不可见元素无法测量）。ResizeObserver 对 display:none
+  // 不触发，这里在恢复显示后主动补一次 fit + resize + 聚焦。
+  useEffect(() => {
+    if (!active) return;
+    const host = node.current;
+    const terminal = terminalRef.current;
+    const fit = fitRef.current;
+    if (!host || !terminal || !fit) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (host.clientWidth <= 0 || host.clientHeight <= 0) return;
+      try {
+        fit.fit();
+      } catch { return; }
+      terminal.focus();
+      void invoke('terminal_resize', { id, cols: terminal.cols, rows: terminal.rows }).catch(() => {});
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [active, id]);
 
   if (!isDesktopRuntime())
     return (
@@ -760,12 +798,20 @@ function TerminalView({ root, id }: { root: string; id: string }) {
 /* 网页                                                                */
 /* ------------------------------------------------------------------ */
 
-function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
+/**
+ * 网页视图：原生子 webview 按 tab id 常驻，切换标签页只 show/hide，
+ * 绝不 close 再 create——那等于整页重载（状态、滚动位置全部丢失）。
+ * DOM 侧的宿主容器同样保留，仅用 display:none 折叠。
+ */
+function WebView({ tab, active, onUrl }: { tab: Tab; active: boolean; onUrl: (url: string) => void }) {
   const [url, setUrl] = useState(tab.url ?? '');
   const [loading, setLoading] = useState(false);
   const frame = useRef<HTMLIFrameElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const id = `browser-${tab.id}`;
+  const initialUrl = useRef(tab.url ?? '');
+  /** webview 是否已创建（幂等标记，配合 ensureWebview 使用） */
+  const created = useRef(false);
   // 回调用 ref 转发：避免 onUrl 身份变化重跑创建 effect（父组件传的是
   // 内联箭头函数，每次渲染都是新引用——effect 若依赖它，会在父级每次
   // 重渲染时 close 再 create 原生 webview，表现为页面不断闪烁）。
@@ -781,9 +827,33 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
       setUrl(value);
       onUrlRef.current(value);
       setLoading(true);
-      if (isDesktopRuntime()) await invoke('browser_control', { id, action: 'navigate', args: { url: value } });
+      if (!isDesktopRuntime()) return;
+      // 从空标签页首次导航时 webview 尚未创建：直接以目标 URL 创建，
+      // 已创建过则跳过，随后 navigate 到目标地址。
+      await ensureWebview(value);
+      await invoke('browser_control', { id, action: 'navigate', args: { url: value } });
     } catch (cause) {
       setUrl(errorText(cause));
+    }
+  };
+
+  /** 确保原生 webview 存在；不存在则按宿主矩形创建（首个 URL 可指定）。 */
+  const ensureWebview = async (firstUrl?: string) => {
+    if (!isDesktopRuntime() || !content.current) return;
+    if (created.current) return;
+    created.current = true;
+    const rect = content.current.getBoundingClientRect();
+    const target = firstUrl ?? initialUrl.current;
+    if (!target) { created.current = false; return; }
+    try {
+      await invoke('browser_control', {
+        id,
+        action: 'create',
+        args: { url: target, x: rect.left, y: rect.top, width: Math.max(1.0, rect.width - WEBVIEW_GUTTER), height: rect.height },
+      });
+    } catch (cause) {
+      created.current = false;
+      throw cause;
     }
   };
 
@@ -795,7 +865,9 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
    */
   const bounds = useCallback(() => {
     const rect = content.current?.getBoundingClientRect();
-    if (!rect || !isDesktopRuntime()) return;
+    // display:none 下的宿主矩形为 0：跳过，避免把 webview 缩成 1x1；
+    // 恢复显示时 active effect 会重新同步正确的位置。
+    if (!rect || rect.width <= 0 || rect.height <= 0 || !isDesktopRuntime()) return;
     void invoke('browser_control', {
       id,
       action: 'bounds',
@@ -806,15 +878,11 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
   // 创建/销毁原生 webview 只应发生一次（挂载与卸载）。tab.url 的后续变化
   // 由 navigate / on_page_load 事件处理，绝不因 url 状态翻转而重建——
   // 重建 = 销毁再创建 = 页面重新加载 = 用户看到的闪烁。
-  const initialUrl = useRef(tab.url ?? '');
+  // 观察器与事件订阅必须无条件挂上：空标签页首次导航后同样需要跟随
+  // 面板尺寸与 loading 状态。
   useEffect(() => {
-    if (!isDesktopRuntime() || !initialUrl.current || !content.current) return;
-    const rect = content.current.getBoundingClientRect();
-    void invoke('browser_control', {
-      id,
-      action: 'create',
-      args: { url: initialUrl.current, x: rect.left, y: rect.top, width: Math.max(1.0, rect.width - WEBVIEW_GUTTER), height: rect.height },
-    }).catch(() => {});
+    if (!isDesktopRuntime() || !content.current) return;
+    void ensureWebview();
     const observer = new ResizeObserver(bounds);
     observer.observe(content.current);
     window.addEventListener('resize', bounds);
@@ -837,6 +905,17 @@ function WebView({ tab, onUrl }: { tab: Tab; onUrl: (url: string) => void }) {
     // 依赖仅 id + bounds（bounds 由 id 派生，稳定）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, bounds]);
+
+  // 切换标签页：原生 webview 隐藏/恢复，而不是销毁。恢复时同步一次
+  // bounds——隐藏期间面板宽度可能变化（ResizeObserver 对 display:none 的
+  // 元素不触发），页面滚动位置与登录态由 webview 自身保留。
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    const action = active ? 'show' : 'hide';
+    void invoke('browser_control', { id, action, args: {} })
+      .then(() => { if (active) bounds(); })
+      .catch(() => {});
+  }, [active, bounds, id]);
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
@@ -906,7 +985,6 @@ export default function RightPanel({
 }) {
   const [tabs, setTabs] = useState<Tab[]>([{ id: 't0', kind: 'new' }]);
   const [active, setActive] = useState('t0');
-  const current = tabs.find((tab) => tab.id === active) ?? tabs[0];
 
   const open = useCallback((kind: TabKind, data: Partial<Tab> = {}) => {
     const id = `t${sequence++}`;
@@ -976,37 +1054,56 @@ export default function RightPanel({
           <PanelRight size={15} />
         </IconBtn>
       </div>
-      <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
-        {current.kind === 'new' && (
-          <div className="scroll-thin min-h-0 min-w-0 flex-1 overflow-y-auto">
-            <div className="px-4 pt-7">
-              <div className="mb-3 text-[13px] font-medium text-[var(--text)]">工具</div>
-              <div className="grid grid-cols-2 gap-2">
-                {tools.map(({ kind, label, key, Icon }) => (
-                  <button
-                    key={kind}
-                    onClick={() => open(kind)}
-                    className="flex h-[62px] min-w-0 flex-col justify-between gap-2 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-2.5 text-left text-[13px] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]"
-                  >
-                    <Icon size={15} className="shrink-0 text-[var(--text-2)]" />
-                    <span className="flex min-w-0 items-center gap-2">
-                      <span className="truncate">{label}</span>
-                      <span className="ml-auto shrink-0">
-                        <Kbd>{key}</Kbd>
-                      </span>
-                    </span>
-                  </button>
-                ))}
-              </div>
+      <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
+        {/*
+         * 状态保持：所有标签页的内容同时挂载，非活动标签用 display:none 折叠。
+         * 之前按 current.kind 条件渲染，切走再切回 = 卸载重挂：终端 PTY 被
+         * 杀掉重开、网页 webview 被销毁重建（页面整页刷新）。现在组件实例
+         * 常驻，只有真正关闭标签（从 tabs 里移除）才触发卸载清理。
+         */}
+        {tabs.map((tab) => {
+          const isActive = tab.id === active;
+          return (
+            <div
+              key={tab.id}
+              className={cn(
+                'flex min-h-0 min-w-0 flex-col overflow-hidden',
+                isActive ? 'relative flex-1' : 'hidden',
+              )}
+            >
+              {tab.kind === 'new' && (
+                <div className="scroll-thin min-h-0 min-w-0 flex-1 overflow-y-auto">
+                  <div className="px-4 pt-7">
+                    <div className="mb-3 text-[13px] font-medium text-[var(--text)]">工具</div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {tools.map(({ kind, label, key, Icon }) => (
+                        <button
+                          key={kind}
+                          onClick={() => open(kind)}
+                          className="flex h-[62px] min-w-0 flex-col justify-between gap-2 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-2.5 text-left text-[13px] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]"
+                        >
+                          <Icon size={15} className="shrink-0 text-[var(--text-2)]" />
+                          <span className="flex min-w-0 items-center gap-2">
+                            <span className="truncate">{label}</span>
+                            <span className="ml-auto shrink-0">
+                              <Kbd>{key}</Kbd>
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {tab.kind === 'files' && (
+                <FilesView root={workspaceRoot ?? ''} tab={tab} onTarget={(next) => update(tab.id, { path: next.path, line: next.line })} />
+              )}
+              {tab.kind === 'diff' && <DiffView root={workspaceRoot ?? ''} tab={tab} />}
+              {tab.kind === 'terminal' && <TerminalView root={workspaceRoot ?? ''} id={`term-${tab.id}`} active={isActive} />}
+              {tab.kind === 'web' && <WebView tab={tab} active={isActive} onUrl={(url) => update(tab.id, { url })} />}
             </div>
-          </div>
-        )}
-        {current.kind === 'files' && (
-          <FilesView root={workspaceRoot ?? ''} tab={current} onTarget={(next) => update(current.id, { path: next.path, line: next.line })} />
-        )}
-        {current.kind === 'diff' && <DiffView root={workspaceRoot ?? ''} tab={current} />}
-        {current.kind === 'terminal' && <TerminalView root={workspaceRoot ?? ''} id={`term-${current.id}`} />}
-        {current.kind === 'web' && <WebView tab={current} onUrl={(url) => update(current.id, { url })} />}
+          );
+        })}
       </div>
     </div>
   );

@@ -261,6 +261,22 @@ export const closeBehaviorApi = {
   set: (behavior: CloseBehavior) => invoke<{ behavior: CloseBehavior }>('close_behavior_set', { behavior }),
 };
 
+/* ---------------- 应用更新检查（GitHub Release tag） ---------------- */
+
+export interface AppUpdateCheck {
+  currentVersion: string;
+  latestVersion?: string;
+  hasUpdate: boolean;
+  releaseUrl?: string;
+  notes?: string;
+  error?: string;
+}
+
+export const updateApi = {
+  /** 检查最新 release；不做自动更新，用户自行前往 release 页下载。 */
+  check: () => invoke<AppUpdateCheck>('app_update_check'),
+};
+
 /** 浏览器预览模式下的提示常量，页面据此显示降级 UI。 */
 export const DESKTOP_ONLY_HINT = '此功能需要桌面版运行';
 

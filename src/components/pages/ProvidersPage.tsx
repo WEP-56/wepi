@@ -1,9 +1,86 @@
 import { useState } from 'react';
-import { Plus, Eye, EyeOff, X, Star, Trash2, CircleCheck, CircleAlert, LoaderCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { Plus, Eye, EyeOff, X, Star, Trash2, CircleCheck, CircleAlert, LoaderCircle, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
 import { uid, type Provider, type ModelDetails } from '../../data';
-import { Btn, Modal, Field, inputCls, Card } from '../kit';
+import { fetchProviderModels } from '../../lib/piRpc';
+import { Btn, Modal, Field, inputCls, Card, Select } from '../kit';
 import { Toggle } from '../ui';
 import { cn } from '../../utils/cn';
+
+const protocolOptions = [
+  { value: 'openai-responses', label: 'OpenAI Responses API' },
+  { value: 'openai-completions', label: 'OpenAI Chat Completions API' },
+  { value: 'anthropic-messages', label: 'Anthropic Messages API' },
+] as const;
+
+type Protocol = (typeof protocolOptions)[number]['value'];
+
+const defaultProtocol = (provider: Provider): Protocol =>
+  protocolOptions.some((option) => option.value === provider.api)
+    ? provider.api as Protocol
+    : provider.kind === 'anthropic' ? 'anthropic-messages' : 'openai-responses';
+
+/**
+ * 模型列表端点：
+ * - OpenAI 协议：{base}/models（baseUrl 应已含 /v1 等版本段）
+ * - Anthropic 协议：{base}/v1/models（baseUrl 无版本段时补 /v1）
+ * - Ollama：baseUrl 无路径时用原生 /api/tags（有 /v1 时走 OpenAI 兼容端点）
+ */
+const modelEndpoint = (baseUrl: string, protocol: Protocol, kind?: Provider['kind']) => {
+  const normalized = baseUrl.trim().replace(/[\\/]+$/, '');
+  if (!normalized) return '';
+  const path = (() => {
+    try {
+      return new URL(normalized).pathname.replace(/[\\/]+$/, '');
+    } catch {
+      return normalized.replace(/^[a-z][a-z\d+\-.]*:\/\//i, '');
+    }
+  })();
+  if (!path && kind === 'ollama') return `${normalized}/api/tags`;
+  const segment = (path.split('/').filter(Boolean).map((s) => s.toLowerCase()).at(-1)) ?? '';
+  const hasVersion = ['v1', 'v1beta', 'v2', 'v3'].includes(segment);
+  if (protocol === 'anthropic-messages') {
+    return hasVersion ? `${normalized}/models` : `${normalized}/v1/models`;
+  }
+  return `${normalized}/models`;
+};
+
+type RemoteModel = { id: string; name?: string; [key: string]: unknown };
+
+function extractModels(payload: unknown): RemoteModel[] {
+  const candidates = Array.isArray(payload)
+    ? payload
+    : payload && typeof payload === 'object'
+      ? (Array.isArray((payload as { data?: unknown }).data)
+        ? (payload as { data: unknown[] }).data
+        : Array.isArray((payload as { models?: unknown }).models) ? (payload as { models: unknown[] }).models : [])
+      : [];
+  const seen = new Set<string>();
+  return candidates.flatMap((entry) => {
+    if (typeof entry === 'string') return [{ id: entry, name: entry }];
+    if (!entry || typeof entry !== 'object') return [];
+    const source = entry as Record<string, unknown>;
+    const id = typeof source.id === 'string' ? source.id : typeof source.model === 'string' ? source.model : typeof source.name === 'string' ? source.name : '';
+    if (!id.trim() || seen.has(id)) return [];
+    seen.add(id);
+    return [{ ...source, id, name: typeof source.name === 'string' ? source.name : id } as RemoteModel];
+  });
+}
+
+const protocolHeaders = (provider: Provider) => {
+  const headers: Record<string, string> = { Accept: 'application/json', ...(provider.headers ?? {}) };
+  const protocol = defaultProtocol(provider);
+  const hasAuthorization = Object.keys(headers).some((key) => key.toLowerCase() === 'authorization');
+  const hasApiKey = Object.keys(headers).some((key) => key.toLowerCase() === 'x-api-key');
+  if (provider.apiKey && !hasAuthorization && !hasApiKey) {
+    if (protocol === 'anthropic-messages') {
+      headers['x-api-key'] = provider.apiKey;
+      if (!Object.keys(headers).some((key) => key.toLowerCase() === 'anthropic-version')) headers['anthropic-version'] = '2023-06-01';
+    } else {
+      headers.Authorization = `Bearer ${provider.apiKey}`;
+    }
+  }
+  return headers;
+};
 
 const kindMeta: Record<Provider['kind'], { color: string; label: string }> = {
   openai: { color: '#10a37f', label: 'OpenAI' },
@@ -29,6 +106,7 @@ function AddDialog({ onClose, onAdd }: { onClose: () => void; onAdd: (p: Provide
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [api, setApi] = useState<Protocol>('openai-responses');
   const valid = name.trim() && /^https?:\/\//.test(baseUrl.trim());
   return (
     <Modal title="添加提供商" onClose={onClose} width={500}>
@@ -37,6 +115,9 @@ function AddDialog({ onClose, onAdd }: { onClose: () => void; onAdd: (p: Provide
       </Field>
       <Field label="Base URL" hint="OpenAI 兼容接口，例如 https://openrouter.ai/api/v1">
         <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://" className={cn(inputCls, 'font-mono text-[12.5px]')} />
+      </Field>
+      <Field label="协议">
+        <Select value={api} options={[...protocolOptions]} onChange={setApi} />
       </Field>
       <Field label="API Key（可选）">
         <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" className={cn(inputCls, 'font-mono text-[12.5px]')} />
@@ -49,7 +130,7 @@ function AddDialog({ onClose, onAdd }: { onClose: () => void; onAdd: (p: Provide
           variant="primary"
           disabled={!valid}
           onClick={() =>
-            onAdd({ id: uid(), name: name.trim(), kind: 'custom', baseUrl: baseUrl.trim(), apiKey, enabled: true, models: [], custom: true })
+            onAdd({ id: uid(), name: name.trim(), kind: 'custom', baseUrl: baseUrl.trim(), api, apiKey, enabled: true, models: [], custom: true })
           }
         >
           添加
@@ -78,9 +159,34 @@ export default function ProvidersPage({
   const [newModel, setNewModel] = useState('');
   const [test, setTest] = useState<Record<string, { s: 'testing' | 'ok' | 'error'; msg: string }>>({});
   const [openModel, setOpenModel] = useState<string | null>(null);
+  const [modelFetch, setModelFetch] = useState<Record<string, { s: 'loading' | 'ok' | 'error'; msg: string }>>({});
 
   const p = providers.find((x) => x.id === sel) ?? providers[0];
   const patch = (id: string, pt: Partial<Provider>) => setProviders((ps) => ps.map((x) => (x.id === id ? { ...x, ...pt } : x)));
+
+  const fetchModels = async () => {
+    if (!p || !p.baseUrl.trim()) return;
+    setModelFetch((states) => ({ ...states, [p.id]: { s: 'loading', msg: '正在获取模型…' } }));
+    try {
+      const payload = await fetchProviderModels(modelEndpoint(p.baseUrl, defaultProtocol(p), p.kind), protocolHeaders(p));
+      const remoteModels = extractModels(payload);
+      if (!remoteModels.length) throw new Error('接口未返回可识别的模型列表');
+      const ids = remoteModels.map((model) => model.id);
+      const details = Object.fromEntries(remoteModels.map((model) => [model.id, {
+        ...(p.modelDetails?.[model.id] ?? {}),
+        ...model,
+        name: model.name ?? model.id,
+      }]));
+      patch(p.id, {
+        models: Array.from(new Set([...p.models, ...ids])),
+        modelDetails: { ...(p.modelDetails ?? {}), ...details },
+      });
+      setModelFetch((states) => ({ ...states, [p.id]: { s: 'ok', msg: `已获取 ${ids.length} 个模型` } }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '获取模型失败';
+      setModelFetch((states) => ({ ...states, [p.id]: { s: 'error', msg: message } }));
+    }
+  };
 
   const runTest = (pr: Provider) => {
     setTest((t) => ({ ...t, [pr.id]: { s: 'testing', msg: '正在连接…' } }));
@@ -104,6 +210,7 @@ export default function ProvidersPage({
   };
 
   const t = p ? test[p.id] : undefined;
+  const mf = p ? modelFetch[p.id] : undefined;
   const patchModel = (modelId: string, details: Partial<ModelDetails>) => {
     if (!p) return;
     const current = p.modelDetails?.[modelId] ?? { id: modelId, name: modelId };
@@ -168,8 +275,8 @@ export default function ProvidersPage({
               <Field label="Base URL">
                 <input value={p.baseUrl} onChange={(e) => patch(p.id, { baseUrl: e.target.value })} className={cn(inputCls, 'font-mono text-[12.5px]')} />
               </Field>
-              <Field label="接口类型" hint="Pi 使用的协议适配器，例如 openai-responses、openai-completions 或 anthropic-messages">
-                <input value={p.api ?? ''} onChange={(e) => patch(p.id, { api: e.target.value })} placeholder="openai-responses" className={cn(inputCls, 'font-mono text-[12.5px]')} />
+              <Field label="接口类型" hint="选择 Pi 支持的协议适配器，模型列表将从 Base URL 下的 models 接口获取">
+                <Select value={defaultProtocol(p)} options={[...protocolOptions]} onChange={(api) => patch(p.id, { api })} className="font-mono text-[12.5px]" />
               </Field>
               <Field label="API Key" hint={p.kind === 'ollama' ? '本地 Ollama 无需 API Key' : '密钥仅保存在本机，不会上传'}>
                 <div className="relative">
@@ -235,9 +342,15 @@ export default function ProvidersPage({
               <button onClick={() => addObjectEntry('compat')} className="mt-3 flex items-center gap-1.5 text-[12.5px] text-[var(--text-2)] hover:text-[var(--text)]"><Plus size={14} /> 添加兼容选项</button>
             </Card>
 
-            <h3 className="mb-3 text-[14px] font-medium text-[var(--text)]">模型</h3>
+            <div className="mb-3 flex items-center gap-3">
+              <h3 className="flex-1 text-[14px] font-medium text-[var(--text)]">模型</h3>
+              {mf && <span className={cn('min-w-0 truncate text-[12px]', mf.s === 'error' ? 'text-[#f85149]' : mf.s === 'ok' ? 'text-[#3fb950]' : 'text-[var(--text-2)]')} title={mf.msg}>{mf.msg}</span>}
+              <Btn onClick={fetchModels} disabled={!p.baseUrl.trim() || mf?.s === 'loading'} className="h-8 px-3">
+                <RefreshCw size={13} className={mf?.s === 'loading' ? 'animate-spin' : ''} /> {mf?.s === 'loading' ? '获取中…' : '从接口获取'}
+              </Btn>
+            </div>
             <Card className="mb-8">
-              {p.models.length === 0 && <div className="px-4 py-6 text-center text-[13px] text-[var(--text-3)]">还没有模型，在下方添加模型 ID。</div>}
+              {p.models.length === 0 && <div className="px-4 py-6 text-center text-[13px] text-[var(--text-3)]">还没有模型，可点击“从接口获取”自动填入，或在下方手动添加。</div>}
               {p.models.map((m) => {
                 const id = `${p.id}:${m}`;
                 const isDefault = defaultModel === id;

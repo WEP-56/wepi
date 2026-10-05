@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from 'react';
-import { X } from 'lucide-react';
+import { Check, ChevronDown, X } from 'lucide-react';
 import { cn } from '../utils/cn';
 
 export function Modal({
@@ -70,6 +70,74 @@ export function Btn({
 
 export const inputCls =
   'h-10 w-full rounded-xl border border-[var(--border-strong)] bg-transparent px-3 text-[13.5px] text-[var(--text)] outline-none placeholder:text-[var(--text-3)] focus:border-[var(--blue)]';
+
+/**
+ * 表单级风格化下拉：外观与 inputCls 输入框一致，
+ * 展开层走 Popover（--bg-elev 深色面板），替代浏览器原生 select。
+ */
+export function Select<T extends string>({
+  value,
+  options,
+  onChange,
+  className,
+}: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const selected = options.find((o) => o.value === value);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false);
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className={cn(inputCls, 'flex items-center justify-between gap-2 text-left', open && 'border-[var(--blue)]', className)}
+      >
+        <span className={cn('min-w-0 flex-1 truncate', !selected && 'text-[var(--text-3)]')}>
+          {selected ? selected.label : '请选择…'}
+        </span>
+        <ChevronDown size={15} className={cn('shrink-0 text-[var(--text-2)] transition-transform', open && 'rotate-180')} />
+      </button>
+      {open && (
+        <div className="fade-in scroll-thin absolute left-0 right-0 top-full z-50 mt-1 max-h-64 overflow-y-auto rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elev)] p-1 shadow-2xl shadow-black/40">
+          {options.map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              onClick={() => {
+                onChange(o.value);
+                setOpen(false);
+              }}
+              className={cn(
+                'flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--text)] hover:bg-[var(--bg-hover)]',
+                o.value === value && 'bg-[var(--bg-active)]',
+              )}
+            >
+              <span className="min-w-0 flex-1 truncate">{o.label}</span>
+              {o.value === value && <Check size={14} className="shrink-0 text-[var(--text-2)]" />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (

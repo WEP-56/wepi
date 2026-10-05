@@ -13,8 +13,10 @@ mod pi_mcp;
 mod pi_skills;
 mod pi_ext;
 mod pi_runtime;
+mod app_update;
 mod toml_lite;
 mod wepi_settings;
+mod wepi_security;
 mod shell_open;
 mod tray;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -192,6 +194,116 @@ async fn pi_config_write(file: String, content: Value) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?
 }
+
+#[tauri::command]
+async fn pi_provider_models_fetch(url: String, headers: HashMap<String, String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let trimmed = url.trim();
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            return Err("模型接口 URL 必须是 http(s)".to_owned());
+        }
+        let mut request = ureq::get(trimmed);
+        for (key, value) in headers {
+            request = request.set(&key, &value);
+        }
+        let response = request.call().map_err(|error| format!("模型接口请求失败：{error}"))?;
+        response
+            .into_json::<Value>()
+            .map_err(|error| format!("模型接口返回的不是有效 JSON：{error}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/* ------------------------------------------------------------------ */
+/*  附件：图片读取与临时落盘                                            */
+/* ------------------------------------------------------------------ */
+
+/// 按扩展名推断图片 MIME；未知类型回落到 octet-stream。
+fn image_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("avif") => "image/avif",
+        _ => "application/octet-stream",
+    }
+}
+
+/// 读取本地图片并编码成 data URL：拖入 / 选择的图片用它渲染缩略图与原图，
+/// 避免为了预览再引入资源协议与作用域配置。
+#[tauri::command]
+async fn read_image_data_url(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = PathBuf::from(path.trim());
+        let meta = fs::metadata(&file).map_err(|error| format!("无法读取图片：{error}"))?;
+        if !meta.is_file() {
+            return Err("目标不是一个文件".to_owned());
+        }
+        const MAX_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
+        if meta.len() > MAX_IMAGE_BYTES {
+            return Err("图片超过 24 MB，未生成预览".to_owned());
+        }
+        let bytes = fs::read(&file).map_err(|error| format!("无法读取图片：{error}"))?;
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(format!("data:{};base64,{encoded}", image_mime(&file)))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 把剪贴板粘贴的图片（data URL）落到临时目录并返回绝对路径。
+/// 粘贴的图片没有磁盘来源，落盘后 Pi 才能按路径真正读到它。
+#[tauri::command]
+async fn save_temp_image(data_url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (header, payload) = data_url
+            .split_once(',')
+            .ok_or_else(|| "图片数据格式不正确".to_owned())?;
+        if !header.starts_with("data:") {
+            return Err("图片数据格式不正确".to_owned());
+        }
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .map_err(|error| format!("图片数据解码失败：{error}"))?;
+        let ext = if header.contains("jpeg") || header.contains("jpg") {
+            "jpg"
+        } else if header.contains("gif") {
+            "gif"
+        } else if header.contains("webp") {
+            "webp"
+        } else if header.contains("bmp") {
+            "bmp"
+        } else {
+            "png"
+        };
+        let dir = std::env::temp_dir().join("wepi-attachments");
+        fs::create_dir_all(&dir).map_err(|error| format!("无法创建临时目录：{error}"))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let seq = TEMP_IMAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let target = dir.join(format!("paste-{stamp}-{seq}.{ext}"));
+        fs::write(&target, bytes).map_err(|error| format!("无法写入临时图片：{error}"))?;
+        Ok(target.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+static TEMP_IMAGE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /* ------------------------------------------------------------------ */
 /*  会话索引：扫描 ~/.pi/agent/sessions                                 */
@@ -588,6 +700,33 @@ fn which_on_path(executable: &str) -> Option<PathBuf> {
     None
 }
 
+/// WEPI 随包分发的内置 pi 扩展（spawn 时以 -e 注入，不污染 ~/.pi）。
+/// 文件位于应用资源目录的 extensions/ 下（与源码树 src-tauri/extensions 同构）。
+fn builtin_extension_paths() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    // 开发态：manifest 目录的 src-tauri/extensions。
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        roots.push(PathBuf::from(manifest_dir).join("extensions"));
+    }
+    // 运行态：可执行文件旁的 extensions/（打包时由 tauri.conf.json resources 复制）。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.join("extensions"));
+        }
+    }
+    let mut paths = Vec::new();
+    for name in ["wepi-security-gate.ts", "wepi-todo.ts"] {
+        for root in &roots {
+            let path = root.join(name);
+            if path.is_file() {
+                paths.push(path);
+                break;
+            }
+        }
+    }
+    paths
+}
+
 fn build_pi_command(executable: &str, session_path: Option<&str>) -> Result<Command, String> {
     let program = locate_pi(executable);
     let managed_launcher = cfg!(windows)
@@ -599,6 +738,12 @@ fn build_pi_command(executable: &str, session_path: Option<&str>) -> Result<Comm
     if let Some(path) = session_path {
         args.push("--session".into());
         args.push(path.to_owned());
+    }
+    // 强制预装扩展：安全门 + todo。可重复 --extension <path> 注入，
+    // 与用户自装扩展天然共存（pi 的发现顺序：项目 → 全局 → -e 显式）。
+    for ext in builtin_extension_paths() {
+        args.push("--extension".into());
+        args.push(ext.to_string_lossy().into_owned());
     }
     let command = if managed_launcher {
         let node = locate_node().ok_or("找不到 Node.js，无法运行 Pi managed 安装")?;
@@ -717,6 +862,19 @@ fn start_process_blocking(
         .stderr(Stdio::piped());
     if let Some(dir) = cwd.as_deref().filter(|s| Path::new(s).is_dir()) {
         command.current_dir(dir);
+    }
+    // 安全门环境注入：必须在 spawn 前设置。
+    // - WEPI_SECURITY_CONFIG：策略快照路径（扩展每次 tool_call 前 stat 热更新）。
+    // - WEPI_SESSION_ID：会话身份 key（sessionLevels 字典查表，不透明值）。
+    // 快照不存在时先确保落盘一份（默认等级 off = 零干预），扩展读取失败
+    // 也会 fail-safe 放行，双保险。
+    {
+        let snapshot = wepi_security::read_snapshot();
+        if let Err(error) = wepi_security::write_snapshot(&snapshot) {
+            eprintln!("[wepi] 安全策略快照写入失败：{error}");
+        }
+        command.env("WEPI_SECURITY_CONFIG", wepi_security::snapshot_path());
+        command.env("WEPI_SESSION_ID", &session_key);
     }
     let mut child = command
         .spawn()
@@ -1012,6 +1170,30 @@ async fn pi_rpc_send(
     session_key: String,
     record: Value,
 ) -> Result<(), String> {
+    let slots = state.slots.clone();
+    tauri::async_runtime::spawn_blocking(move || write_record(&slots, &session_key, &record))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 回复 pi 的 extension_ui_request（RPC Extension UI 协议的 client→pi 半边）。
+///
+/// pi 侧扩展调用 ctx.ui.confirm/select 等对话方法时进程会阻塞等待；前端审批卡
+/// / ask 卡收集用户选择后经此命令把 extension_ui_response 直写 pi stdin。
+/// payload 形如 { "id": <请求id>, "confirmed": true } 或 { "id": ..., "value": "..." }
+/// 或 { "id": ..., "cancelled": true }——按 id 关联，不依赖顺序。
+#[tauri::command]
+async fn pi_rpc_respond_ui(
+    state: State<'_, RpcProcess>,
+    session_key: String,
+    payload: Value,
+) -> Result<(), String> {
+    let mut record = payload;
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("type".into(), Value::String("extension_ui_response".into()));
+    } else {
+        return Err("extension_ui_response 负载必须是对象".to_owned());
+    }
     let slots = state.slots.clone();
     tauri::async_runtime::spawn_blocking(move || write_record(&slots, &session_key, &record))
         .await
@@ -1573,6 +1755,36 @@ async fn pi_runtime_diagnostics() -> Result<Value, String> {
 }
 
 /* ------------------------------------------------------------------ */
+/*  安全管理（等级配置 + 快照 + 会话覆盖）                              */
+/* ------------------------------------------------------------------ */
+
+#[tauri::command]
+async fn wepi_security_snapshot() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(wepi_security::read_snapshot)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn wepi_security_save(config: Value) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || wepi_security::save_config(config))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn wepi_security_set_session_level(
+    session_id: String,
+    level_id: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        wepi_security::set_session_level(&session_id, level_id.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/* ------------------------------------------------------------------ */
 /*  系统打开能力                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -1632,12 +1844,16 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pi_rpc_start,
             pi_rpc_send,
+            pi_rpc_respond_ui,
             pi_rpc_stop,
             pi_rpc_stop_all,
             pi_rpc_wait_ready,
             pi_rpc_prepare,
             pi_config_read,
             pi_config_write,
+            pi_provider_models_fetch,
+            read_image_data_url,
+            save_temp_image,
             pi_sessions_scan,
             pi_session_read,
             pi_session_delete,
@@ -1672,6 +1888,10 @@ pub fn run() {
             shell_open_with_system,
             shell_open_in_vscode,
             shell_open_capabilities,
+            wepi_security_snapshot,
+            wepi_security_save,
+            wepi_security_set_session_level,
+            app_update::app_update_check,
             tray::close_behavior_get,
             tray::close_behavior_set
             ,workspace::workspace_request, workspace::terminal_start, workspace::terminal_write, workspace::terminal_resize, workspace::terminal_close, workspace::browser_control
