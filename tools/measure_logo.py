@@ -1,4 +1,4 @@
-"""测量 logo.png 的字形边界与填充率，并输出紧凑裁剪版（去多余透明边距）。
+"""测量 logo 的字形边界与填充率，并输出紧凑裁剪版（去多余透明边距）。
 
 填充率不足 ~88% 的图标在系统托盘 / 任务栏里会显得明显偏小——Windows 把
 ico 的 32px 与托盘的 16px 区域按「含透明边距的整个画布」缩放，logo 四周
@@ -7,7 +7,7 @@ ico 的 32px 与托盘的 16px 区域按「含透明边距的整个画布」缩�
 """
 from PIL import Image
 
-SRC = r"E:\WEPI\docs\logo.png"
+SRC = r"E:\WEPI\logo.png"
 OUT = r"E:\WEPI\src\assets-icon-base.png"
 
 img = Image.open(SRC).convert("RGBA")

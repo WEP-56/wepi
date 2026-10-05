@@ -171,6 +171,17 @@ export default function Settings({
   useEffect(() => localStorage.setItem('github-linked', String(githubLinked)), [githubLinked]);
   useEffect(() => localStorage.setItem('git-preferences', JSON.stringify(gitState)), [gitState]);
 
+  /* 应用版本：运行时从 Tauri 读取（来源 tauri.conf.json 的 version，
+     单一真实来源）；浏览器预览退回编译期注入的 package.json 版本。 */
+  const [appVersion, setAppVersion] = useState(__APP_VERSION__);
+  useEffect(() => {
+    if (!isDesktopRuntime()) return;
+    import('@tauri-apps/api/app')
+      .then((mod) => mod.getVersion())
+      .then(setAppVersion)
+      .catch(() => {});
+  }, []);
+
   /* 关闭行为（Rust 托管：窗口关闭事件在 Rust 层拦截，必须读写 Rust 侧状态） */
   const [closeBehavior, setCloseBehavior] = useState<CloseBehavior>('quit');
   useEffect(() => {
@@ -492,7 +503,7 @@ export default function Settings({
                 <div className="mt-1.5 text-[13px] text-[var(--text-2)]">开源 AI Agent 桌面工作台</div>
                 <div className="mt-3 flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-card)] px-3 py-1 text-[12px] text-[var(--text-2)]">
                   <span className="size-1.5 rounded-full bg-[#3fb950]" />
-                  v0.1.1
+                  v{appVersion}
                 </div>
               </div>
 
@@ -516,7 +527,7 @@ export default function Settings({
 
               <Section title="应用信息">
                 <Row title="版本" desc="语义化版本，随发布递增">
-                  <span className="font-mono text-[12.5px] text-[var(--text-2)]">0.1.1</span>
+                  <span className="font-mono text-[12.5px] text-[var(--text-2)]">{appVersion}</span>
                 </Row>
                 <Row title="构建方式" desc="Rust 后端 + 单文件前端产物">
                   <span className="font-mono text-[12.5px] text-[var(--text-2)]">Vite · singlefile</span>
