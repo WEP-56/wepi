@@ -150,6 +150,15 @@ fn run_pi(args: &[&str], online: bool) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// 使用 Pi 原生 OAuth 流程登录 MCP 服务器。Pi 负责打开浏览器、接收回调并
+/// 将令牌保存到 ~/.pi/agent/mcp-auth.json，WEPI 不接触令牌内容。
+pub fn mcp_login(server: &str) -> Result<String, String> {
+    if !crate::pi_mcp::is_valid_server_name(server) {
+        return Err("服务器名称非法".to_owned());
+    }
+    run_pi(&["mcp", "login", server], true)
+}
+
 /// 解析 `pi list` 输出：User/Project 段 + 包源行 + 紧随其后的路径行。
 fn parse_list_output(raw: &str) -> Vec<Value> {
     let mut result = Vec::<Value>::new();

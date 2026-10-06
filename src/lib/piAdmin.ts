@@ -31,10 +31,27 @@ export interface McpServerDefinition {
   cwd?: string;
   url?: string;
   headers?: Record<string, string>;
-  socket?: string;
+  oauth?: McpOAuthConfig;
+  timeout?: number;
+  exposure?: McpExposure;
+  toolExposure?: Record<string, McpExposure>;
+  description?: string;
   disabled?: boolean;
   enabled?: boolean;
   [key: string]: unknown;
+}
+
+export type McpExposure = 'codemode' | 'deferred' | 'direct' | 'hidden';
+
+export interface McpOAuthConfig {
+  clientId?: string;
+  clientSecret?: string;
+  callbackPort?: number;
+  callbackUrl?: string;
+  scope?: string;
+  clientName?: string;
+  clientRegistration?: 'cimd';
+  authServerMetadataUrl?: string;
 }
 
 export interface McpSnapshot {
@@ -75,6 +92,7 @@ export const mcpApi = {
   importApply: (entries: [string, McpServerDefinition][], overwrite: boolean) =>
     invoke<{ imported: number; skipped: string[] }>('pi_mcp_import_apply', { entries, overwrite }),
   probe: (definition: McpServerDefinition) => invoke<McpProbeResult>('pi_mcp_probe', { definition }),
+  login: (server: string) => invoke<string>('pi_mcp_login', { server }),
 };
 
 /* ---------------- 技能 ---------------- */

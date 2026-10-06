@@ -1585,6 +1585,13 @@ async fn pi_mcp_probe(definition: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn pi_mcp_login(server: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || pi_ext::mcp_login(&server))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn pi_skills_list() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(pi_skills::list)
         .await
@@ -1862,6 +1869,7 @@ pub fn run() {
             pi_mcp_import_scan,
             pi_mcp_import_apply,
             pi_mcp_probe,
+            pi_mcp_login,
             pi_skills_list,
             pi_skills_read,
             pi_skills_create,

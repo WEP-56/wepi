@@ -4,7 +4,7 @@
 //! - 按 pi-mcp-adapter 的层级从低到高合并：`~/.config/mcp/mcp.json` →
 //!   `~/.agents/mcp.json` → `~/.agents/mcp/mcp.json` → `~/.pi/agent/mcp.json`（可写）
 //! - 同名 server 浅合并（后层字段覆盖前层），`{disabled:true}` 不会冲掉下层传输定义
-//! - 只有传输定义（command/url/socket）写在可写层时，删除才会真正移除条目
+//! - 只有传输定义（command/url）写在可写层时，删除才会真正移除条目
 //! - 不启动 MCP 运行时；探测只检查 stdio 命令是否存在于 PATH / HTTP URL 是否可达
 
 use crate::toml_lite::parse_toml;
@@ -59,17 +59,47 @@ pub fn is_valid_server_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// 由定义推断传输方式：command/url/socket 恰好出现一个才算有效。
+/// Pi 当前支持 stdio（command）和 streamable HTTP（url）。
 pub fn infer_transport(def: &Value) -> Option<&'static str> {
     let has_command = def.get("command").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty());
     let has_url = def.get("url").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty());
-    let has_socket = def.get("socket").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty());
-    match (has_command as u8 + has_url as u8 + has_socket as u8) == 1 {
+    match (has_command as u8 + has_url as u8) == 1 {
         true if has_command => Some("stdio"),
         true if has_url => Some("http"),
-        true if has_socket => Some("socket"),
         _ => None,
     }
+}
+
+fn validate_server_definition(name: &str, definition: &Value) -> Result<(), String> {
+    if !definition.is_object() {
+        return Err(format!("服务器「{name}」的配置必须是对象"));
+    }
+    if infer_transport(definition).is_none() {
+        return Err(format!("服务器「{name}」需要恰好一个 command 或 url"));
+    }
+    if let Some(timeout) = definition.get("timeout") {
+        if !timeout.as_f64().is_some_and(|value| value > 0.0 && value.is_finite()) {
+            return Err(format!("服务器「{name}」的 timeout 必须是正数"));
+        }
+    }
+    const EXPOSURES: [&str; 4] = ["codemode", "deferred", "direct", "hidden"];
+    if let Some(exposure) = definition.get("exposure").and_then(Value::as_str) {
+        if !EXPOSURES.contains(&exposure) && exposure != "codemode-deferred" {
+            return Err(format!("服务器「{name}」的 exposure 无效"));
+        }
+    }
+    if let Some(overrides) = definition.get("toolExposure") {
+        let Some(map) = overrides.as_object() else {
+            return Err(format!("服务器「{name}」的 toolExposure 必须是对象"));
+        };
+        if map.values().any(|value| match value.as_str() {
+            Some(exposure) => !EXPOSURES.contains(&exposure) && exposure != "codemode-deferred",
+            None => true,
+        }) {
+            return Err(format!("服务器「{name}」的 toolExposure 含有无效模式"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_mcp_file(raw: &str) -> Result<(Map<String, Value>, Vec<String>), String> {
@@ -145,7 +175,7 @@ fn merge_servers(layers: &[(String, Map<String, Value>)], writable_path: &str) -
 }
 
 fn has_any_transport(def: &Value) -> bool {
-    ["command", "url", "socket"].iter().any(|key| def.get(*key).and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty()))
+    ["command", "url"].iter().any(|key| def.get(*key).and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty()))
 }
 
 fn load_layer(path: &Path) -> Option<Result<(String, Map<String, Value>, Vec<String>), String>> {
@@ -251,12 +281,7 @@ pub fn save_writable(content: Value) -> Result<(), String> {
                 if !is_valid_server_name(name) {
                     return Err(format!("服务器名称非法：「{name}」"));
                 }
-                if !definition.is_object() {
-                    return Err(format!("服务器「{name}」的配置必须是对象"));
-                }
-                if infer_transport(definition).is_none() {
-                    return Err(format!("服务器「{name}」需要恰好一个 command / url / socket"));
-                }
+                validate_server_definition(name, definition)?;
                 servers.insert(name.clone(), definition.clone());
             }
         } else if key != "_extras" {
@@ -301,7 +326,7 @@ fn extract_vendor_servers(parsed: &Value, codex: bool) -> Vec<(String, Value)> {
     }
     if !codex {
         // 少数 Claude 导出是裸 map（顶层直接就是 server 名 → 定义）。
-        const TRANSPORT_KEYS: [&str; 7] = ["command", "url", "socket", "type", "args", "env", "headers"];
+        const TRANSPORT_KEYS: [&str; 7] = ["command", "url", "type", "args", "env", "headers", "oauth"];
         if let Some(map) = parsed.as_object() {
             let looks_bare = !map.is_empty()
                 && map.values().all(|value| {
@@ -322,10 +347,9 @@ fn convert_vendor_definition(raw: &Value, codex: bool, warnings: &mut Vec<String
     let object = raw.as_object()?;
     let command = object.get("command").and_then(Value::as_str).filter(|v| !v.trim().is_empty());
     let url = object.get("url").and_then(Value::as_str).filter(|v| !v.trim().is_empty());
-    let socket = object.get("socket").and_then(Value::as_str).filter(|v| !v.trim().is_empty());
-    let transport_count = command.is_some() as u8 + url.is_some() as u8 + socket.is_some() as u8;
+    let transport_count = command.is_some() as u8 + url.is_some() as u8;
     if transport_count != 1 {
-        warnings.push("需要恰好一个 command / url / socket".to_owned());
+        warnings.push("需要恰好一个 command 或 url".to_owned());
         return None;
     }
     let mut definition = Map::new();
@@ -342,6 +366,9 @@ fn convert_vendor_definition(raw: &Value, codex: bool, warnings: &mut Vec<String
             let cleaned: Map<String, Value> = env.iter().filter(|(_, v)| v.is_string()).map(|(k, v)| (k.clone(), v.clone())).collect();
             definition.insert("env".into(), Value::Object(cleaned));
         }
+        if let Some(cwd) = object.get("cwd").and_then(Value::as_str) {
+            definition.insert("cwd".into(), Value::String(cwd.to_owned()));
+        }
     }
     if let Some(url) = url {
         definition.insert("url".into(), Value::String(url.to_owned()));
@@ -349,9 +376,14 @@ fn convert_vendor_definition(raw: &Value, codex: bool, warnings: &mut Vec<String
             let cleaned: Map<String, Value> = headers.iter().filter(|(_, v)| v.is_string()).map(|(k, v)| (k.clone(), v.clone())).collect();
             definition.insert("headers".into(), Value::Object(cleaned));
         }
+        if let Some(oauth) = object.get("oauth").and_then(Value::as_object) {
+            definition.insert("oauth".into(), Value::Object(oauth.clone()));
+        }
     }
-    if let Some(socket) = socket {
-        definition.insert("socket".into(), Value::String(socket.to_owned()));
+    for key in ["timeout", "exposure", "toolExposure", "description"] {
+        if let Some(value) = object.get(key) {
+            definition.insert(key.to_owned(), value.clone());
+        }
     }
     if codex {
         if object.get("enabled") == Some(&Value::Bool(false)) {
@@ -494,7 +526,7 @@ fn find_on_path(command: &str) -> Option<PathBuf> {
 /// 不启动 MCP 握手——可达即视为配置有效（与 PiDeck 口径一致）。
 pub fn probe_server(definition: &Value) -> Value {
     let Some(transport) = infer_transport(definition) else {
-        return json!({ "ok": false, "error": "需要恰好一个 command / url / socket" });
+        return json!({ "ok": false, "error": "需要恰好一个 command 或 url" });
     };
     match transport {
         "stdio" => {
@@ -511,16 +543,7 @@ pub fn probe_server(definition: &Value) -> Value {
                 Err(error) => json!({ "ok": false, "transport": "http", "error": error }),
             }
         }
-        _ => {
-            let socket = definition.get("socket").and_then(Value::as_str).unwrap_or_default();
-            if socket.trim().is_empty() {
-                json!({ "ok": false, "transport": "socket", "error": "socket 路径为空" })
-            } else if Path::new(socket).exists() {
-                json!({ "ok": true, "transport": "socket", "detail": socket })
-            } else {
-                json!({ "ok": false, "transport": "socket", "error": format!("socket 不存在：{socket}") })
-            }
-        }
+        _ => json!({ "ok": false, "error": "未知传输方式" }),
     }
 }
 
@@ -561,5 +584,36 @@ fn probe_http(url: &str) -> Result<String, String> {
         Ok(format!("HTTP {code}"))
     } else {
         Err(format!("HTTP {code}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_only_pi_supported_transports() {
+        assert_eq!(infer_transport(&json!({ "command": "npx" })), Some("stdio"));
+        assert_eq!(infer_transport(&json!({ "url": "https://example.com/mcp" })), Some("http"));
+        assert_eq!(infer_transport(&json!({ "socket": "/tmp/mcp.sock" })), None);
+        assert_eq!(infer_transport(&json!({ "command": "npx", "url": "https://example.com" })), None);
+    }
+
+    #[test]
+    fn validates_exposure_and_timeout() {
+        assert!(validate_server_definition(
+            "docs",
+            &json!({ "url": "https://example.com/mcp", "exposure": "deferred", "timeout": 30,
+                "toolExposure": { "search_*": "direct" } })
+        ).is_ok());
+        assert!(validate_server_definition(
+            "docs",
+            &json!({ "url": "https://example.com/mcp", "exposure": "invalid" })
+        ).is_err());
+        assert!(validate_server_definition(
+            "docs",
+            &json!({ "url": "https://example.com/mcp", "timeout": 0 })
+        ).is_err());
     }
 }

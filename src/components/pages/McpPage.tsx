@@ -10,6 +10,7 @@ import {
   XCircle,
   Search,
   Layers,
+  LogIn,
 } from 'lucide-react';
 import { Btn, Modal, Field, inputCls, Segmented, Card } from '../kit';
 import { Toggle } from '../ui';
@@ -21,24 +22,24 @@ import {
   type McpSnapshot,
   type McpListItem,
   type McpServerDefinition,
+  type McpExposure,
   type McpImportScan,
   type McpProbeResult,
 } from '../../lib/piAdmin';
 
 /* ---------- 纯工具：与后端/PiDeck 的字段口径一致 ---------- */
 
-type Transport = 'stdio' | 'http' | 'socket';
+type Transport = 'stdio' | 'http';
 
 const inferTransport = (def: McpServerDefinition | null | undefined): Transport | null => {
   if (!def) return null;
   const hasCommand = typeof def.command === 'string' && def.command.trim().length > 0;
   const hasUrl = typeof def.url === 'string' && def.url.trim().length > 0;
-  const hasSocket = typeof def.socket === 'string' && def.socket.trim().length > 0;
-  const count = Number(hasCommand) + Number(hasUrl) + Number(hasSocket);
+  const count = Number(hasCommand) + Number(hasUrl);
   if (count !== 1) return null;
   if (hasCommand) return 'stdio';
   if (hasUrl) return 'http';
-  return 'socket';
+  return 'http';
 };
 
 const isServerDisabled = (def: McpServerDefinition | null | undefined) => {
@@ -71,7 +72,28 @@ const layerLabels: Record<string, string> = {
 };
 
 const blankDefinition = (transport: Transport): McpServerDefinition =>
-  transport === 'http' ? { url: 'https://' } : transport === 'socket' ? { socket: '' } : { command: 'npx', args: ['-y'] };
+  transport === 'http' ? { url: 'https://' } : { command: 'npx', args: ['-y'] };
+
+const exposureOptions: { value: McpExposure; label: string }[] = [
+  { value: 'codemode', label: 'Codemode（默认）' },
+  { value: 'deferred', label: 'Deferred（工具搜索）' },
+  { value: 'direct', label: 'Direct（直接披露）' },
+  { value: 'hidden', label: 'Hidden（隐藏）' },
+];
+
+const exposureMapToText = (record?: Record<string, McpExposure>) =>
+  Object.entries(record ?? {}).map(([key, value]) => `${key}=${value}`).join('\n');
+const textToExposureMap = (text: string): Record<string, McpExposure> => {
+  const valid = new Set<McpExposure>(['codemode', 'deferred', 'direct', 'hidden']);
+  return Object.fromEntries(
+    text.split('\n').map((line) => line.trim()).filter((line) => line.includes('='))
+      .map((line) => {
+        const index = line.indexOf('=');
+        const value = line.slice(index + 1).trim() as McpExposure;
+        return [line.slice(0, index).trim(), value] as [string, McpExposure];
+      }).filter(([key, value]) => key && valid.has(value)),
+  );
+};
 
 /* ---------- 编辑器表单 ---------- */
 
@@ -86,6 +108,8 @@ function ServerEditor({
   probe,
   probing,
   onProbe,
+  onLogin,
+  loggingIn,
   originPath,
   ownedByWritable,
   onRemove,
@@ -101,6 +125,8 @@ function ServerEditor({
   probe: McpProbeResult | null;
   probing: boolean;
   onProbe: () => void;
+  onLogin?: () => void;
+  loggingIn?: boolean;
   originPath?: string;
   ownedByWritable?: boolean;
   onRemove?: () => void;
@@ -124,14 +150,13 @@ function ServerEditor({
           options={[
             { value: 'stdio', label: '本地进程 (stdio)' },
             { value: 'http', label: '远程 (HTTP)' },
-            { value: 'socket', label: 'Socket' },
           ]}
         />
       </Field>
       {transport === 'stdio' && (
         <>
           <Field label="命令">
-            <input value={definition.command ?? ''} onChange={(e) => onPatch({ command: e.target.value, url: undefined, socket: undefined })} placeholder="npx" className={cn(inputCls, 'font-mono text-[12.5px]')} />
+            <input value={definition.command ?? ''} onChange={(e) => onPatch({ command: e.target.value, url: undefined })} placeholder="npx" className={cn(inputCls, 'font-mono text-[12.5px]')} />
           </Field>
           <Field label="参数" hint="以空格分隔">
             <input value={argsToText(definition.args)} onChange={(e) => onPatch({ args: textToArgs(e.target.value) })} placeholder="-y chrome-devtools-mcp" className={cn(inputCls, 'font-mono text-[12.5px]')} />
@@ -145,18 +170,50 @@ function ServerEditor({
               className="scroll-thin w-full resize-none rounded-xl border border-[var(--border-strong)] bg-transparent px-3 py-2 font-mono text-[12.5px] leading-6 text-[var(--text)] outline-none placeholder:text-[var(--text-3)] focus:border-[var(--blue)]"
             />
           </Field>
+          <Field label="工作目录" hint="可使用 ~；相对路径相对于 Pi 会话目录">
+            <input value={definition.cwd ?? ''} onChange={(e) => onPatch({ cwd: e.target.value || undefined })} placeholder="~/projects/my-mcp" className={cn(inputCls, 'font-mono text-[12.5px]')} />
+          </Field>
         </>
       )}
       {transport === 'http' && (
-        <Field label="服务器 URL" hint="需以 http:// 或 https:// 开头">
-          <input value={definition.url ?? ''} onChange={(e) => onPatch({ url: e.target.value, command: undefined, args: undefined, socket: undefined })} placeholder="https://mcp.example.com/mcp" className={cn(inputCls, 'font-mono text-[12.5px]')} />
-        </Field>
+        <>
+          <Field label="服务器 URL" hint="需以 http:// 或 https:// 开头；Pi 使用 streamable HTTP">
+            <input value={definition.url ?? ''} onChange={(e) => onPatch({ url: e.target.value, command: undefined, args: undefined, env: undefined, cwd: undefined })} placeholder="https://mcp.example.com/mcp" className={cn(inputCls, 'font-mono text-[12.5px]')} />
+          </Field>
+          <Field label="请求头" hint="每行一个 Header=VALUE，值可使用 ${ENV_VAR} 或 !command">
+            <textarea value={recordToText(definition.headers)} onChange={(e) => onPatch({ headers: textToRecord(e.target.value) })} rows={3} placeholder="Authorization=Bearer ${MCP_TOKEN}" className="scroll-thin w-full resize-none rounded-xl border border-[var(--border-strong)] bg-transparent px-3 py-2 font-mono text-[12.5px] leading-6 text-[var(--text)] outline-none placeholder:text-[var(--text-3)] focus:border-[var(--blue)]" />
+          </Field>
+          <Field label="OAuth 配置" hint="留空则使用 Pi 的动态注册；登录由 Pi 保存到 mcp-auth.json">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <input value={definition.oauth?.clientId ?? ''} onChange={(e) => onPatch({ oauth: { ...definition.oauth, clientId: e.target.value || undefined } })} placeholder="clientId（可选）" className={cn(inputCls, 'font-mono text-[12px]')} />
+              <input type="password" value={definition.oauth?.clientSecret ?? ''} onChange={(e) => onPatch({ oauth: { ...definition.oauth, clientSecret: e.target.value || undefined } })} placeholder="clientSecret / ${ENV_VAR}" className={cn(inputCls, 'font-mono text-[12px]')} />
+              <input value={definition.oauth?.scope ?? ''} onChange={(e) => onPatch({ oauth: { ...definition.oauth, scope: e.target.value || undefined } })} placeholder="scope（空格分隔）" className={cn(inputCls, 'font-mono text-[12px]')} />
+              <input value={definition.oauth?.clientName ?? ''} onChange={(e) => onPatch({ oauth: { ...definition.oauth, clientName: e.target.value || undefined } })} placeholder="clientName（可选）" className={cn(inputCls, 'font-mono text-[12px]')} />
+              <input value={definition.oauth?.callbackPort ?? ''} onChange={(e) => onPatch({ oauth: { ...definition.oauth, callbackPort: e.target.value ? Number(e.target.value) : undefined } })} type="number" min={1} max={65535} placeholder="callbackPort" className={cn(inputCls, 'font-mono text-[12px]')} />
+              <input value={definition.oauth?.callbackUrl ?? ''} onChange={(e) => onPatch({ oauth: { ...definition.oauth, callbackUrl: e.target.value || undefined } })} placeholder="callbackUrl（仅 localhost）" className={cn(inputCls, 'font-mono text-[12px]')} />
+              <input value={definition.oauth?.authServerMetadataUrl ?? ''} onChange={(e) => onPatch({ oauth: { ...definition.oauth, authServerMetadataUrl: e.target.value || undefined } })} placeholder="authServerMetadataUrl" className={cn(inputCls, 'font-mono text-[12px]')} />
+              <select value={definition.oauth?.clientRegistration ?? ''} onChange={(e) => onPatch({ oauth: { ...definition.oauth, clientRegistration: e.target.value === 'cimd' ? 'cimd' : undefined } })} className={cn(inputCls, 'text-[12px]')}>
+                <option value="">动态注册（默认）</option>
+                <option value="cimd">CIMD 客户端元数据</option>
+              </select>
+            </div>
+          </Field>
+        </>
       )}
-      {transport === 'socket' && (
-        <Field label="Socket 路径">
-          <input value={definition.socket ?? ''} onChange={(e) => onPatch({ socket: e.target.value, command: undefined, url: undefined })} placeholder="/tmp/mcp.sock" className={cn(inputCls, 'font-mono text-[12.5px]')} />
+      <Field label="工具披露模式" hint="决定模型如何发现该服务器的工具">
+        <Segmented value={definition.exposure ?? 'codemode'} onChange={(value) => onPatch({ exposure: value as McpExposure })} options={exposureOptions} />
+      </Field>
+      <Field label="工具级披露覆盖" hint="每行 tool 名称或通配模式=codemode|deferred|direct|hidden">
+        <textarea value={exposureMapToText(definition.toolExposure)} onChange={(e) => onPatch({ toolExposure: textToExposureMap(e.target.value) })} rows={3} placeholder={'search_code=direct\ndelete_*=hidden'} className="scroll-thin w-full resize-none rounded-xl border border-[var(--border-strong)] bg-transparent px-3 py-2 font-mono text-[12.5px] leading-6 text-[var(--text)] outline-none placeholder:text-[var(--text-3)] focus:border-[var(--blue)]" />
+      </Field>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <Field label="请求超时（秒）" hint="默认 60；进度通知会重置计时">
+          <input type="number" min={1} value={definition.timeout ?? ''} onChange={(e) => onPatch({ timeout: e.target.value ? Number(e.target.value) : undefined })} placeholder="60" className={cn(inputCls, 'font-mono text-[12.5px]')} />
         </Field>
-      )}
+        <Field label="服务器描述" hint="会出现在系统提示词中">
+          <input value={definition.description ?? ''} onChange={(e) => onPatch({ description: e.target.value || undefined })} placeholder="搜索并读取产品文档" className={cn(inputCls, 'text-[12.5px]')} />
+        </Field>
+      </div>
       {originPath && (
         <div className="rounded-xl bg-[var(--bg-hover)] px-3 py-2 text-[12px] text-[var(--text-3)]" title={originPath}>
           来源：{originPath}
@@ -167,6 +224,11 @@ function ServerEditor({
         <Btn onClick={onProbe} disabled={probing}>
           <Wrench size={13} /> {probing ? '探测中…' : '连通性探测'}
         </Btn>
+        {transport === 'http' && onLogin && (
+          <Btn onClick={onLogin} disabled={loggingIn}>
+            <LogIn size={13} /> {loggingIn ? '等待授权…' : '使用 Pi 登录 OAuth'}
+          </Btn>
+        )}
         {onRemove && (
           <Btn variant="danger" onClick={onRemove}>
             <Trash2 size={13} /> {removeLabel ?? '删除'}
@@ -311,7 +373,7 @@ function ImportDialog({ onClose, onImported }: { onClose: () => void; onImported
                     <div className="mt-0.5 truncate font-mono text-[11.5px] text-[var(--text-3)]">
                       {candidate.definition.command
                         ? `${candidate.definition.command} ${(candidate.definition.args ?? []).join(' ')}`
-                        : candidate.definition.url ?? candidate.definition.socket ?? ''}
+                        : candidate.definition.url ?? ''}
                     </div>
                   )}
                   {(candidate.blocker || candidate.warnings.length > 0) && (
@@ -360,6 +422,7 @@ export default function McpPage({ onToast }: { onToast: (s: string) => void }) {
   const [jsonError, setJsonError] = useState('');
   const [probe, setProbe] = useState<McpProbeResult | null>(null);
   const [probing, setProbing] = useState(false);
+  const [loggingIn, setLoggingIn] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [search, setSearch] = useState('');
   const loadGeneration = useRef(0);
@@ -431,7 +494,16 @@ export default function McpPage({ onToast }: { onToast: (s: string) => void }) {
 
   const switchTransport = (next: Transport) => {
     // 切换传输时保留启停与变量字段，清掉互斥的传输定义。
-    const kept = { env: editingDef.env, headers: editingDef.headers, enabled: editingDef.enabled, disabled: editingDef.disabled };
+    const kept = {
+      env: editingDef.env,
+      headers: editingDef.headers,
+      enabled: editingDef.enabled,
+      disabled: editingDef.disabled,
+      timeout: editingDef.timeout,
+      exposure: editingDef.exposure,
+      toolExposure: editingDef.toolExposure,
+      description: editingDef.description,
+    };
     const nextDef = { ...blankDefinition(next), ...kept };
     if (creating) {
       setCreating({ ...creating, definition: nextDef });
@@ -471,6 +543,19 @@ export default function McpPage({ onToast }: { onToast: (s: string) => void }) {
       setProbe({ ok: false, error: adminErrorMessage(caught, '探测失败') });
     } finally {
       setProbing(false);
+    }
+  };
+
+  const login = async () => {
+    if (!selected) return;
+    setLoggingIn(true);
+    try {
+      await mcpApi.login(selected);
+      onToast('Pi OAuth 登录完成');
+    } catch (caught) {
+      onToast(adminErrorMessage(caught, 'Pi OAuth 登录失败'));
+    } finally {
+      setLoggingIn(false);
     }
   };
 
@@ -638,7 +723,7 @@ export default function McpPage({ onToast }: { onToast: (s: string) => void }) {
                       <div className="mt-0.5 truncate font-mono text-[11.5px] text-[var(--text-3)]">
                         {item.definition.command
                           ? `${item.definition.command} ${(item.definition.args ?? []).join(' ')}`
-                          : item.definition.url ?? item.definition.socket ?? '（仅停用覆盖）'}
+                          : item.definition.url ?? '（仅停用覆盖）'}
                       </div>
                     </button>
                   );
@@ -663,6 +748,8 @@ export default function McpPage({ onToast }: { onToast: (s: string) => void }) {
                     probe={probe}
                     probing={probing}
                     onProbe={runProbe}
+                    onLogin={selected && transport === 'http' ? login : undefined}
+                    loggingIn={loggingIn}
                     originPath={selectedItem?.originPath}
                     ownedByWritable={selectedItem?.ownedByWritable}
                     onRemove={creating ? undefined : removeSelected}
