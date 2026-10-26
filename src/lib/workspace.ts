@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { isDesktopRuntime } from './piRpc';
 
-export type TabKind = 'new' | 'files' | 'diff' | 'terminal' | 'web';
+export type TabKind = 'new' | 'files' | 'diff' | 'terminal' | 'web' | 'simulator';
 export type ReviewScope = 'working' | 'staged' | 'branch' | 'turn';
 export interface PanelTarget { kind: TabKind; path?: string; line?: number; url?: string; reviewId?: string; n: number }
 export interface FileEntry { name: string; path: string; directory: boolean; symlink: boolean }

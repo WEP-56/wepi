@@ -17,7 +17,7 @@ import type { Attachment, Message, Project, Thread, FileEdit, TurnBlock } from '
 import { ActivityTimeline, streamingLabelOf } from './ActivityView';
 import Markdown from './Markdown';
 import MessageNavigator from './MessageNavigator';
-import { AttachmentThumb, ImageViewer } from './Attachments';
+import { AttachmentThumb, ElementChip, ImageViewer } from './Attachments';
 import { AppIcon, IconBtn } from './ui';
 import { RenameInput } from './kit';
 import { cn } from '../utils/cn';
@@ -337,6 +337,7 @@ export default function ChatView({
               const atts = m.attachments ?? [];
               const images = atts.filter((att) => att.kind === 'image');
               const files = atts.filter((att) => att.kind === 'file');
+              const elements = atts.filter((att) => att.kind === 'element');
               return (
                 <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-6 flex scroll-mt-24 justify-end">
                   <div className="group/u flex max-w-[78%] flex-col items-end">
@@ -359,7 +360,7 @@ export default function ChatView({
                         ))}
                       </div>
                     )}
-                    {files.length > 0 && m.content && (
+                    {(files.length > 0 || elements.length > 0) && (
                       <div className="mb-2 flex flex-wrap justify-end gap-1.5">
                         {files.map((att) => (
                           <span
@@ -370,6 +371,9 @@ export default function ChatView({
                             <FileText size={12} className="shrink-0 text-[var(--blue)]" />
                             <span className="truncate font-mono text-[var(--blue)]">{att.path || att.value}</span>
                           </span>
+                        ))}
+                        {elements.map((att) => (
+                          <ElementChip key={att.id} att={att} />
                         ))}
                       </div>
                     )}

@@ -49,19 +49,35 @@ export type TurnBlock =
       isError?: boolean;
     };
 
-/** 输入框 / 消息携带的附件。图片用 data URL 直接渲染，文件只用路径。 */
+/**
+ * 从内置浏览器拾取的页面元素快照。字段与 Rust 侧 `sanitize_element` 一一对应，
+ * 长度上限也在那边裁剪；这里只负责随消息带给 Pi。
+ */
+export interface BrowserElement {
+  url: string;
+  title: string;
+  selector: string;
+  tag: string;
+  text: string;
+  html: string;
+  bounds: { x: number; y: number; width: number; height: number };
+}
+
+/** 输入框 / 消息携带的附件。图片用 data URL 直接渲染，文件只用路径，元素用快照。 */
 export interface Attachment {
   id: string;
-  kind: 'image' | 'file';
-  /** 展示名（图片为文件名或“粘贴的图片”，文件为路径末段） */
+  kind: 'image' | 'file' | 'element';
+  /** 展示名（图片为文件名或“粘贴的图片”，文件为路径末段，元素为 CSS 选择器） */
   name: string;
   /**
    * 图片：data URL（缩略图与原图共用），持久化时会被剥离以保护 localStorage 配额；
-   * 文件：显示用的绝对路径或文件名。
+   * 文件：显示用的绝对路径或文件名；元素：选择器（给 chip 兜底显示）。
    */
   value: string;
   /** 桌面端可得的绝对磁盘路径——Pi 需要靠它读到真实文件 */
   path?: string;
+  /** kind === 'element' 时的页面元素快照 */
+  element?: BrowserElement;
 }
 
 /**

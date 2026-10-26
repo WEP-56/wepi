@@ -75,7 +75,7 @@ import {
   type ComposerDraft,
   type PendingSend,
 } from './data';
-import { attachmentFromPath, attachmentPromptBlock, ensureAttachmentPaths, forPersistence } from './lib/attachments';
+import { attachmentFromPath, attachmentPromptBlock, elementAttachment, ensureAttachmentPaths, forPersistence } from './lib/attachments';
 
 interface NavState {
   view: ViewId;
@@ -505,7 +505,16 @@ export default function App() {
     const key = draftKeyRef.current;
     setDrafts((all) => {
       const current = all[key] ?? EMPTY_DRAFT;
-      return { ...all, [key]: { ...current, attachments: [...current.attachments, ...list] } };
+      // 同一个页面元素重复拾取只保留一份：提示词里出现两份相同上下文只会浪费 token。
+      const merged = [...current.attachments];
+      for (const att of list) {
+        const duplicate = att.kind === 'element' && merged.some((existing) =>
+          existing.kind === 'element'
+          && existing.element?.selector === att.element?.selector
+          && existing.element?.url === att.element?.url);
+        if (!duplicate) merged.push(att);
+      }
+      return { ...all, [key]: { ...current, attachments: merged } };
     });
   }, []);
 
@@ -1618,6 +1627,14 @@ export default function App() {
                     onToggleCover={() => setRightCover((c) => !c)}
                     workspaceRoot={project?.path ?? undefined}
                     target={panelTarget}
+                    onAttachElement={(element) => {
+                      // 元素是给当前会话的上下文：不在会话页时不收，避免落进看不见的草稿。
+                      if (nav.view !== 'home') {
+                        showToast('先打开一个会话，再把页面元素加进消息');
+                        return;
+                      }
+                      appendToDraft([elementAttachment(element)]);
+                    }}
                   />
                 )}
               </div>

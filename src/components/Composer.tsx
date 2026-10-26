@@ -30,7 +30,7 @@ import {
 import { pickDirectory } from '../lib/fs';
 import { activeSlashQuery, filterCommands, type SlashCommand } from '../lib/slashCommands';
 import { Popover, MenuItem } from './ui';
-import { AttachmentThumb, ImageViewer } from './Attachments';
+import { AttachmentThumb, ElementChip, ImageViewer } from './Attachments';
 import { SlashMenu } from './SlashMenu';
 import ModelEffortPanel, { effortLabel } from './ModelEffortPanel';
 import ContextUsage, { type UsageSnapshot } from './ContextUsage';
@@ -393,6 +393,8 @@ export default function Composer({
                     <X size={11} />
                   </button>
                 </div>
+              ) : att.kind === 'element' ? (
+                <ElementChip key={att.id} att={att} onRemove={() => removeAttachment(att.id)} />
               ) : (
                 <span
                   key={att.id}

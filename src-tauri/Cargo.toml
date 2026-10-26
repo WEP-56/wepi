@@ -19,6 +19,9 @@ portable-pty = "0.9"
 base64 = "0.22"
 similar = "2.7"
 ignore = "0.4"
+# 模拟器取帧与 agent 截图：把 screencap 的 PNG 缩放到 dp / 面板宽度后编成 JPEG。
+# tauri 的 image-png 特性已经带了这个 crate，这里只是把它变成直接依赖。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # WEPI 自管扩展管理用：抓取 pi.dev / skills.sh / npm registry 需要一个
 # 简单阻塞式 HTTP 客户端（只在 spawn_blocking 里调用）。
 ureq = { version = "2", features = ["json"] }
@@ -29,3 +32,9 @@ tauri-plugin-dialog = "2"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+# 依赖按 opt-level 2 编译，自己的 crate 保持 0：dev 下增量编译照样快，
+# 但 `image` 的 resize/JPEG 这类密集循环能快几十倍。
+# 实测模拟器面板取帧：resize 775ms → 20ms 量级，直接决定面板跟不跟手。
+[profile.dev.package."*"]
+opt-level = 2

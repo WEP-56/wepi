@@ -4,6 +4,7 @@ import {
   ArrowRight,
   ChevronDown,
   ChevronRight,
+  Crosshair,
   FileCode2,
   FileDiff,
   Files,
@@ -17,6 +18,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Smartphone,
   SquareTerminal,
   X,
 } from 'lucide-react';
@@ -36,6 +38,8 @@ import {
   type TabKind,
 } from '../lib/workspace';
 import { isDesktopRuntime } from '../lib/piRpc';
+import type { BrowserElement } from '../data';
+import SimulatorView from './SimulatorView';
 import '@xterm/xterm/css/xterm.css';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -51,13 +55,14 @@ interface Tab {
   line?: number;
 }
 
-const titles: Record<TabKind, string> = { new: '新标签页', files: '文件', diff: '变更', terminal: '终端', web: '网页' };
-const icons: Record<TabKind, typeof Globe> = { new: Globe, files: Files, diff: FileDiff, terminal: SquareTerminal, web: Globe };
+const titles: Record<TabKind, string> = { new: '新标签页', files: '文件', diff: '变更', terminal: '终端', web: '网页', simulator: '模拟器' };
+const icons: Record<TabKind, typeof Globe> = { new: Globe, files: Files, diff: FileDiff, terminal: SquareTerminal, web: Globe, simulator: Smartphone };
 const tools: { kind: TabKind; label: string; key: string; Icon: typeof Globe }[] = [
   { kind: 'diff', label: '变更', key: 'Ctrl+Shift+G', Icon: FileDiff },
   { kind: 'files', label: '文件', key: 'Ctrl+P', Icon: Files },
   { kind: 'terminal', label: '终端', key: 'Ctrl+`', Icon: SquareTerminal },
   { kind: 'web', label: '网页', key: 'Ctrl+L', Icon: Globe },
+  { kind: 'simulator', label: '模拟器', key: 'Ctrl+Shift+M', Icon: Smartphone },
 ];
 const actionClass =
   'flex h-7 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] bg-[var(--bg-hover)] px-2 text-[12px] text-[var(--text)] transition-colors hover:bg-[var(--bg-active)] disabled:opacity-40';
@@ -803,9 +808,22 @@ function TerminalView({ root, id, active }: { root: string; id: string; active: 
  * 绝不 close 再 create——那等于整页重载（状态、滚动位置全部丢失）。
  * DOM 侧的宿主容器同样保留，仅用 display:none 折叠。
  */
-function WebView({ tab, active, onUrl }: { tab: Tab; active: boolean; onUrl: (url: string) => void }) {
+function WebView({
+  tab,
+  active,
+  onUrl,
+  onAttachElement,
+}: {
+  tab: Tab;
+  active: boolean;
+  onUrl: (url: string) => void;
+  /** 拾取到元素后交给上层（附加到输入框）。缺省时拾取按钮不出现。 */
+  onAttachElement?: (element: BrowserElement) => void;
+}) {
   const [url, setUrl] = useState(tab.url ?? '');
   const [loading, setLoading] = useState(false);
+  /** 拾取进行中。真值以 Rust 的 browser-pick 事件为准，点击只做乐观切换。 */
+  const [picking, setPicking] = useState(false);
   const frame = useRef<HTMLIFrameElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const id = `browser-${tab.id}`;
@@ -817,6 +835,18 @@ function WebView({ tab, active, onUrl }: { tab: Tab; active: boolean; onUrl: (ur
   // 重渲染时 close 再 create 原生 webview，表现为页面不断闪烁）。
   const onUrlRef = useRef(onUrl);
   useEffect(() => { onUrlRef.current = onUrl; });
+  // 同理：拾取回调每次渲染都是新引用，用 ref 转发避免事件订阅反复重挂。
+  const onAttachRef = useRef(onAttachElement);
+  useEffect(() => { onAttachRef.current = onAttachElement; });
+
+  /** 进入/退出拾取模式。真正的注入与轮询在 Rust 侧。 */
+  const togglePick = () => {
+    if (!isDesktopRuntime()) return;
+    const next = !picking;
+    setPicking(next);
+    void invoke('browser_control', { id, action: 'pick', args: { enabled: next } })
+      .catch(() => setPicking(false));
+  };
 
   const navigate = async () => {
     let value = url.trim();
@@ -896,10 +926,26 @@ function WebView({ tab, active, onUrl }: { tab: Tab; active: boolean; onUrl: (ur
       }
       setLoading(event.payload.loading === true);
     }).then((unlisten) => { stopEvents = unlisten; });
+    // 拾取状态与结果：Rust 侧每 250ms 轮询页面，读到元素就发 browser-element。
+    let stopPick: UnlistenFn | undefined;
+    void listen<{ id: string; picking: boolean }>('browser-pick', (event) => {
+      if (event.payload.id !== id) return;
+      setPicking(event.payload.picking === true);
+    }).then((unlisten) => { stopPick = unlisten; });
+    let stopElement: UnlistenFn | undefined;
+    void listen<BrowserElement & { id: string }>('browser-element', (event) => {
+      if (event.payload.id !== id) return;
+      // 事件里的 id 只用于路由，不进提示词。
+      const { id: _tab, ...element } = event.payload;
+      setPicking(false);
+      onAttachRef.current?.(element);
+    }).then((unlisten) => { stopElement = unlisten; });
     return () => {
       observer.disconnect();
       window.removeEventListener('resize', bounds);
       stopEvents?.();
+      stopPick?.();
+      stopElement?.();
       void invoke('browser_control', { id, action: 'close', args: {} }).catch(() => {});
     };
     // 依赖仅 id + bounds（bounds 由 id 派生，稳定）。
@@ -943,7 +989,23 @@ function WebView({ tab, active, onUrl }: { tab: Tab; active: boolean; onUrl: (ur
         <IconBtn title="刷新" className="shrink-0" onClick={() => void navigate()}>
           <RefreshCw size={13} />
         </IconBtn>
+        {onAttachElement && isDesktopRuntime() && (
+          <IconBtn
+            title={picking ? '取消选择元素（Esc）' : '选择页面元素'}
+            active={picking}
+            className="shrink-0"
+            onClick={togglePick}
+          >
+            <Crosshair size={14} />
+          </IconBtn>
+        )}
       </div>
+      {picking && (
+        <div className="flex shrink-0 items-center gap-1.5 border-b border-[var(--border)] bg-[var(--bg-hover)] px-3 py-1.5 text-[11.5px] text-[var(--text-2)]">
+          <Crosshair size={12} className="shrink-0 text-[var(--blue)]" />
+          点击页面元素附加到消息，Esc 取消
+        </div>
+      )}
       {isDesktopRuntime() ? (
         <div ref={content} className="flex min-h-0 min-w-0 flex-1 items-center justify-center text-[12px] text-[var(--text-3)]">
           {loading ? '网页加载中…' : '在内置 WebView 中打开网页'}
@@ -973,6 +1035,7 @@ export default function RightPanel({
   onToggleCover,
   workspaceRoot,
   target,
+  onAttachElement,
 }: {
   onClose: () => void;
   openKind: { kind: TabKind; n: number; reviewId?: string } | null;
@@ -982,6 +1045,8 @@ export default function RightPanel({
   onToggleCover: () => void;
   workspaceRoot?: string;
   target?: PanelTarget | null;
+  /** 网页标签里拾取到的元素：交给上层附加到当前草稿。 */
+  onAttachElement?: (element: BrowserElement) => void;
 }) {
   const [tabs, setTabs] = useState<Tab[]>([{ id: 't0', kind: 'new' }]);
   const [active, setActive] = useState('t0');
@@ -1100,7 +1165,15 @@ export default function RightPanel({
               )}
               {tab.kind === 'diff' && <DiffView root={workspaceRoot ?? ''} tab={tab} />}
               {tab.kind === 'terminal' && <TerminalView root={workspaceRoot ?? ''} id={`term-${tab.id}`} active={isActive} />}
-              {tab.kind === 'web' && <WebView tab={tab} active={isActive} onUrl={(url) => update(tab.id, { url })} />}
+              {tab.kind === 'web' && (
+                <WebView
+                  tab={tab}
+                  active={isActive}
+                  onUrl={(url) => update(tab.id, { url })}
+                  onAttachElement={onAttachElement}
+                />
+              )}
+              {tab.kind === 'simulator' && <SimulatorView active={isActive} />}
             </div>
           );
         })}

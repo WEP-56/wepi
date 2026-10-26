@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ImageOff, X } from 'lucide-react';
+import { Crosshair, ImageOff, X } from 'lucide-react';
 import type { Attachment } from '../data';
 import { resolveImageSrc } from '../lib/attachments';
 import { cn } from '../utils/cn';
@@ -55,6 +55,38 @@ export function AttachmentThumb({
     );
   }
   return <img src={src} alt={att.name} title={title ?? att.name} className={className} draggable={false} />;
+}
+
+/** 页面元素 chip：草稿与已发消息共用。元素快照只在提示词里，chip 只展示选择器。 */
+export function ElementChip({
+  att,
+  onRemove,
+}: {
+  att: Attachment;
+  onRemove?: () => void;
+}) {
+  const element = att.element;
+  const label = element?.selector || att.name;
+  const hint = element ? `${element.title || element.url}\n${label}` : label;
+  return (
+    <span
+      title={hint}
+      className="flex max-w-full items-center gap-1.5 rounded-lg bg-[var(--bg-hover)] px-2 py-1 text-[12px]"
+    >
+      <Crosshair size={12} className="shrink-0 text-[var(--blue)]" />
+      <span className="max-w-[260px] truncate font-mono text-[var(--blue)]">{label}</span>
+      {onRemove && (
+        <button
+          type="button"
+          title="移除"
+          onClick={onRemove}
+          className="shrink-0 text-[var(--text-3)] hover:text-[var(--text)]"
+        >
+          <X size={11} />
+        </button>
+      )}
+    </span>
+  );
 }
 
 /** 查看原图：全屏浮层，Esc 或点击空白关闭。 */

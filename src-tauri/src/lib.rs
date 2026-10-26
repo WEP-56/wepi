@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 mod workspace;
+mod bridge;
+mod simulator;
 mod pi_mcp;
 mod pi_skills;
 mod pi_ext;
@@ -715,7 +717,7 @@ fn builtin_extension_paths() -> Vec<PathBuf> {
         }
     }
     let mut paths = Vec::new();
-    for name in ["wepi-security-gate.ts", "wepi-todo.ts"] {
+    for name in ["wepi-security-gate.ts", "wepi-todo.ts", "wepi-tools.ts"] {
         for root in &roots {
             let path = root.join(name);
             if path.is_file() {
@@ -875,6 +877,14 @@ fn start_process_blocking(
         }
         command.env("WEPI_SECURITY_CONFIG", wepi_security::snapshot_path());
         command.env("WEPI_SESSION_ID", &session_key);
+    }
+    // 桌面工具桥：内置扩展 wepi-tools.ts 用它注册模拟器等工具。
+    // 桥起不来就不注入，扩展静默跳过，Pi 本身不受影响。
+    if let Some((url, token)) = bridge::endpoint(&app) {
+        command.env(
+            "WEPI_BRIDGE",
+            serde_json::json!({ "url": url, "token": token }).to_string(),
+        );
     }
     let mut child = command
         .spawn()
@@ -1828,6 +1838,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(RpcProcess::new()).manage(workspace::WorkspaceState::default())
+        .manage(simulator::Simulators::default())
         .setup(|app| {
             // 托盘图标 + 菜单（打开 / 退出）。失败不阻塞启动——托盘是
             // 增强能力，环境不支持时窗口应用仍应正常起来。
@@ -1903,6 +1914,7 @@ pub fn run() {
             tray::close_behavior_get,
             tray::close_behavior_set
             ,workspace::workspace_request, workspace::terminal_start, workspace::terminal_write, workspace::terminal_resize, workspace::terminal_close, workspace::browser_control
+            ,simulator::commands::simulator_status, simulator::commands::simulator_select, simulator::commands::simulator_power, simulator::commands::simulator_frame, simulator::commands::simulator_input, simulator::commands::simulator_capture, simulator::commands::simulator_appearance
         ])
         .run(tauri::generate_context!())
         .expect("error while running WEPI");
