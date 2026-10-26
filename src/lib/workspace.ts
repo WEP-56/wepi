@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
+import { isPreviewOnlyPath } from './office';
 import { isDesktopRuntime } from './piRpc';
 
-export type TabKind = 'new' | 'files' | 'diff' | 'terminal' | 'web' | 'simulator';
+export type TabKind = 'new' | 'files' | 'diff' | 'terminal' | 'web' | 'simulator' | 'preview';
 export type ReviewScope = 'working' | 'staged' | 'branch' | 'turn';
 export interface PanelTarget { kind: TabKind; path?: string; line?: number; url?: string; reviewId?: string; n: number }
 export interface FileEntry { name: string; path: string; directory: boolean; symlink: boolean }
@@ -31,7 +32,8 @@ export function fileTarget(value: string): Omit<PanelTarget, 'n'> | null {
   const line = location ? Number(location[1] ?? location[2]) : undefined;
   if (location) path = path.slice(0, location.index);
   if (!path || /[\r\n]/.test(path)) return null;
-  return { kind: 'files', path, line };
+  // 文件标签只做代码/文本浏览；Office/PDF/图片链接直接开预览标签。
+  return { kind: isPreviewOnlyPath(path) ? 'preview' : 'files', path, line };
 }
 
 export function looksLikeFile(value: string) {

@@ -35,7 +35,10 @@ struct Producer {
 
 impl Producer {
     fn idle(&self) -> bool {
-        self.pulled.lock().map(|at| at.elapsed() > IDLE).unwrap_or(true)
+        self.pulled
+            .lock()
+            .map(|at| at.elapsed() > IDLE)
+            .unwrap_or(true)
     }
     fn touch(&self) {
         if let Ok(mut pulled) = self.pulled.lock() {
@@ -71,13 +74,21 @@ impl Streams {
     fn producer(&self, name: &str) -> Arc<Producer> {
         let mut map = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         if let Some(existing) = map.get(name) {
-            let finished = existing.latest.lock().map(|latest| latest.finished).unwrap_or(true);
+            let finished = existing
+                .latest
+                .lock()
+                .map(|latest| latest.finished)
+                .unwrap_or(true);
             if !finished {
                 existing.touch();
                 return existing.clone();
             }
         }
-        let producer = Arc::new(Producer { latest: Mutex::default(), ready: Condvar::new(), pulled: Mutex::new(Instant::now()) });
+        let producer = Arc::new(Producer {
+            latest: Mutex::default(),
+            ready: Condvar::new(),
+            pulled: Mutex::new(Instant::now()),
+        });
         map.insert(name.to_owned(), producer.clone());
         let worker = producer.clone();
         let name = name.to_owned();
@@ -112,7 +123,10 @@ impl Streams {
         let mut latest = producer.latest.lock().map_err(|error| error.to_string())?;
         loop {
             if latest.seq > after {
-                return Ok(Some(Frame { seq: latest.seq, jpeg: latest.jpeg.clone() }));
+                return Ok(Some(Frame {
+                    seq: latest.seq,
+                    jpeg: latest.jpeg.clone(),
+                }));
             }
             if latest.finished {
                 return match latest.error.clone() {
@@ -124,7 +138,11 @@ impl Streams {
             if left.is_zero() {
                 return Ok(None);
             }
-            latest = producer.ready.wait_timeout(latest, left).map_err(|error| error.to_string())?.0;
+            latest = producer
+                .ready
+                .wait_timeout(latest, left)
+                .map_err(|error| error.to_string())?
+                .0;
         }
     }
 

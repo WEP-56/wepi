@@ -1,3 +1,5 @@
+import type { OfficeSelection } from './lib/office';
+
 export type Role = 'user' | 'assistant';
 
 export interface FileEdit {
@@ -66,18 +68,21 @@ export interface BrowserElement {
 /** 输入框 / 消息携带的附件。图片用 data URL 直接渲染，文件只用路径，元素用快照。 */
 export interface Attachment {
   id: string;
-  kind: 'image' | 'file' | 'element';
+  kind: 'image' | 'file' | 'element' | 'office';
   /** 展示名（图片为文件名或“粘贴的图片”，文件为路径末段，元素为 CSS 选择器） */
   name: string;
   /**
    * 图片：data URL（缩略图与原图共用），持久化时会被剥离以保护 localStorage 配额；
-   * 文件：显示用的绝对路径或文件名；元素：选择器（给 chip 兜底显示）。
+   * 文件：显示用的绝对路径或文件名；元素：选择器（给 chip 兜底显示）；
+   * office：文档绝对路径。
    */
   value: string;
   /** 桌面端可得的绝对磁盘路径——Pi 需要靠它读到真实文件 */
   path?: string;
   /** kind === 'element' 时的页面元素快照 */
   element?: BrowserElement;
+  /** kind === 'office' 时的文档选区 */
+  office?: OfficeSelection;
 }
 
 /**

@@ -27,8 +27,18 @@ fn home_dir() -> PathBuf {
 fn skill_locations() -> Vec<(&'static str, &'static str, PathBuf, bool)> {
     let home = home_dir();
     vec![
-        ("pi-global", "~/.pi/agent/skills", home.join(".pi").join("agent").join("skills"), true),
-        ("agents-global", "~/.agents/skills", home.join(".agents").join("skills"), false),
+        (
+            "pi-global",
+            "~/.pi/agent/skills",
+            home.join(".pi").join("agent").join("skills"),
+            true,
+        ),
+        (
+            "agents-global",
+            "~/.agents/skills",
+            home.join(".agents").join("skills"),
+            false,
+        ),
     ]
 }
 
@@ -58,7 +68,10 @@ fn normalize_skill_name(value: &str) -> String {
 /// 解析 SKILL.md frontmatter 的最小 YAML 子集（键: 值 行）。
 fn parse_frontmatter(raw: &str) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
-    let Some(start) = raw.starts_with("---").then(|| raw.find('\n').map(|index| index + 1).unwrap_or(3)) else {
+    let Some(start) = raw
+        .starts_with("---")
+        .then(|| raw.find('\n').map(|index| index + 1).unwrap_or(3))
+    else {
         return result;
     };
     let rest = &raw[start..];
@@ -66,7 +79,9 @@ fn parse_frontmatter(raw: &str) -> BTreeMap<String, String> {
         return result;
     };
     for line in rest[..end].lines() {
-        let Some(colon) = line.find(':') else { continue };
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
         let key = line[..colon].trim();
         let mut value = line[colon + 1..].trim().to_owned();
         if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
@@ -83,7 +98,10 @@ fn parse_frontmatter(raw: &str) -> BTreeMap<String, String> {
 
 fn set_frontmatter_flag(raw: &str, key: &str, value: bool) -> String {
     let target = format!("{key}: {}", if value { "true" } else { "false" });
-    let Some(start) = raw.starts_with("---").then(|| raw.find('\n').map(|index| index + 1).unwrap_or(3)) else {
+    let Some(start) = raw
+        .starts_with("---")
+        .then(|| raw.find('\n').map(|index| index + 1).unwrap_or(3))
+    else {
         return format!("---\n{target}\n---\n\n{raw}");
     };
     let rest = &raw[start..];
@@ -110,7 +128,12 @@ fn set_frontmatter_flag(raw: &str, key: &str, value: bool) -> String {
     format!("---\n{target}\n---\n\n{raw}")
 }
 
-fn skill_summary(skill_path: &Path, location_id: &str, location_label: &str, kind: &str) -> Option<Value> {
+fn skill_summary(
+    skill_path: &Path,
+    location_id: &str,
+    location_label: &str,
+    kind: &str,
+) -> Option<Value> {
     let raw = fs::read_to_string(skill_path).unwrap_or_default();
     if raw.is_empty() {
         return None;
@@ -119,10 +142,19 @@ fn skill_summary(skill_path: &Path, location_id: &str, location_label: &str, kin
     let fallback = if kind == "markdown" {
         skill_path.file_stem()?.to_string_lossy().into_owned()
     } else {
-        skill_path.parent()?.file_name()?.to_string_lossy().into_owned()
+        skill_path
+            .parent()?
+            .file_name()?
+            .to_string_lossy()
+            .into_owned()
     };
-    let name = frontmatter.get("name").filter(|v| !v.trim().is_empty()).cloned().unwrap_or(fallback);
-    let description = frontmatter.get("description").cloned().unwrap_or_default();    let mut warnings = Vec::new();
+    let name = frontmatter
+        .get("name")
+        .filter(|v| !v.trim().is_empty())
+        .cloned()
+        .unwrap_or(fallback);
+    let description = frontmatter.get("description").cloned().unwrap_or_default();
+    let mut warnings = Vec::new();
     if name.is_empty() {
         warnings.push("缺少 name".to_owned());
     }
@@ -135,8 +167,14 @@ fn skill_summary(skill_path: &Path, location_id: &str, location_label: &str, kin
     if description.chars().count() > DESCRIPTION_MAX {
         warnings.push("描述超过 1024 字符".to_owned());
     }
-    let user_only = frontmatter.get("disable-model-invocation").map(String::as_str) == Some("true");
-    let dir = skill_path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let user_only = frontmatter
+        .get("disable-model-invocation")
+        .map(String::as_str)
+        == Some("true");
+    let dir = skill_path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     Some(json!({
         "id": format!("{location_id}:{}", skill_path.to_string_lossy()),
         "name": name,
@@ -189,7 +227,9 @@ fn scan_location(location_id: &str, label: &str, root: &Path, root_markdown: boo
                 if child.file_type().ok().is_some_and(|t| t.is_dir()) {
                     let nested_skill = child_path.join(SKILL_FILE);
                     if nested_skill.is_file() {
-                        if let Some(summary) = skill_summary(&nested_skill, location_id, label, "directory") {
+                        if let Some(summary) =
+                            skill_summary(&nested_skill, location_id, label, "directory")
+                        {
                             out.push(summary);
                         }
                     }
@@ -212,10 +252,17 @@ pub fn list() -> Result<Value, String> {
     for (id, label, path, root_markdown) in skill_locations() {
         fs::create_dir_all(&path).ok();
         for summary in scan_location(id, label, &path, root_markdown) {
-            let name = summary.get("name").and_then(Value::as_str).unwrap_or_default().to_lowercase();
+            let name = summary
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
             let replace = match seen.get(&name) {
                 None => true,
-                Some(existing) => existing.get("sourceId").and_then(Value::as_str) == Some("agents-global") && id == "pi-global",
+                Some(existing) => {
+                    existing.get("sourceId").and_then(Value::as_str) == Some("agents-global")
+                        && id == "pi-global"
+                }
             };
             if replace {
                 seen.insert(name, summary);
@@ -259,7 +306,12 @@ pub fn read_content(skill_path: &str) -> Result<Value, String> {
 }
 
 /// 新建技能：frontmatter + 正文模板落到指定位置。
-pub fn create(location_id: &str, name: &str, description: &str, content: Option<&str>) -> Result<Value, String> {
+pub fn create(
+    location_id: &str,
+    name: &str,
+    description: &str,
+    content: Option<&str>,
+) -> Result<Value, String> {
     let normalized = normalize_skill_name(name);
     if normalized.is_empty() {
         return Err("技能名不能为空".to_owned());
@@ -277,8 +329,12 @@ pub fn create(location_id: &str, name: &str, description: &str, content: Option<
         return Err(format!("技能「{normalized}」已存在").to_owned());
     }
     fs::create_dir_all(&skill_dir).map_err(|e| format!("无法创建技能目录：{e}"))?;
-    let body = content.unwrap_or("# 使用说明\n\n描述 Agent 在什么场景下使用这个技能，以及具体步骤。\n");
-    let raw = format!("---\nname: {normalized}\ndescription: {}\n---\n\n{body}\n", description.replace('\n', " "));
+    let body =
+        content.unwrap_or("# 使用说明\n\n描述 Agent 在什么场景下使用这个技能，以及具体步骤。\n");
+    let raw = format!(
+        "---\nname: {normalized}\ndescription: {}\n---\n\n{body}\n",
+        description.replace('\n', " ")
+    );
     let skill_path = skill_dir.join(SKILL_FILE);
     fs::write(&skill_path, raw).map_err(|e| format!("无法写入技能：{e}"))?;
     skill_summary(&skill_path, location_id, "~/.pi/agent/skills", "directory")
@@ -310,7 +366,10 @@ pub fn rename(skill_path: &str, new_name: &str) -> Result<Value, String> {
     if normalized.is_empty() {
         return Err("新名称不能为空".to_owned());
     }
-    let kind = summary.get("type").and_then(Value::as_str).unwrap_or("directory");
+    let kind = summary
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("directory");
     let old_path = PathBuf::from(skill_path);
     let raw = fs::read_to_string(&old_path).map_err(|e| format!("读取技能失败：{e}"))?;
     let target = if kind == "markdown" {
@@ -323,17 +382,31 @@ pub fn rename(skill_path: &str, new_name: &str) -> Result<Value, String> {
         return Err(format!("目标「{normalized}」已存在").to_owned());
     }
     fs::rename(&old_path, &target).map_err(|e| format!("重命名失败：{e}"))?;
-    let new_skill_path = if kind == "markdown" { target.clone() } else { target.join(SKILL_FILE) };
+    let new_skill_path = if kind == "markdown" {
+        target.clone()
+    } else {
+        target.join(SKILL_FILE)
+    };
     let next_raw = set_frontmatter_name(&raw, new_name.trim());
     fs::write(&new_skill_path, next_raw).map_err(|e| format!("更新技能名失败：{e}"))?;
-    let location_id = summary.get("sourceId").and_then(Value::as_str).unwrap_or("pi-global");
-    let location_label = summary.get("sourceLabel").and_then(Value::as_str).unwrap_or("~/.pi/agent/skills");
-    skill_summary(&new_skill_path, location_id, location_label, kind).ok_or_else(|| "重命名成功但读取失败".to_owned())
+    let location_id = summary
+        .get("sourceId")
+        .and_then(Value::as_str)
+        .unwrap_or("pi-global");
+    let location_label = summary
+        .get("sourceLabel")
+        .and_then(Value::as_str)
+        .unwrap_or("~/.pi/agent/skills");
+    skill_summary(&new_skill_path, location_id, location_label, kind)
+        .ok_or_else(|| "重命名成功但读取失败".to_owned())
 }
 
 fn set_frontmatter_name(raw: &str, name: &str) -> String {
     let target = format!("name: {name}");
-    let Some(start) = raw.starts_with("---").then(|| raw.find('\n').map(|index| index + 1).unwrap_or(3)) else {
+    let Some(start) = raw
+        .starts_with("---")
+        .then(|| raw.find('\n').map(|index| index + 1).unwrap_or(3))
+    else {
         return format!("---\n{target}\n---\n\n{raw}");
     };
     let rest = &raw[start..];
@@ -366,13 +439,15 @@ pub fn delete(skill_path: &str) -> Result<(), String> {
     let target = PathBuf::from(skill_path);
     let canonical = fs::canonicalize(&target).map_err(|e| format!("定位技能失败：{e}"))?;
     let allowed = skill_locations().iter().any(|(_, _, root, _)| {
-        fs::canonicalize(root)
-            .is_ok_and(|root_canonical| canonical.starts_with(root_canonical))
+        fs::canonicalize(root).is_ok_and(|root_canonical| canonical.starts_with(root_canonical))
     });
     if !allowed {
         return Err("拒绝删除技能目录之外的路径".to_owned());
     }
-    let kind = summary.get("type").and_then(Value::as_str).unwrap_or("directory");
+    let kind = summary
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("directory");
     if kind == "markdown" {
         fs::remove_file(&canonical).map_err(|e| format!("删除失败：{e}"))
     } else {
@@ -407,7 +482,10 @@ pub fn store_search(query: &str, limit: u32) -> Result<Value, String> {
             let slug = item.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
             let installs = item.get("installs").and_then(Value::as_u64).unwrap_or(0);
-            let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
+            let source = item
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if slug.is_empty() {
                 continue;
             }
@@ -420,7 +498,11 @@ pub fn store_search(query: &str, limit: u32) -> Result<Value, String> {
             }));
         }
     }
-    items.sort_by(|a, b| b.get("installs").and_then(Value::as_u64).cmp(&a.get("installs").and_then(Value::as_u64)));
+    items.sort_by(|a, b| {
+        b.get("installs")
+            .and_then(Value::as_u64)
+            .cmp(&a.get("installs").and_then(Value::as_u64))
+    });
     Ok(json!({ "query": trimmed, "total": items.len(), "items": items }))
 }
 
@@ -428,7 +510,9 @@ fn urlencode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -467,9 +551,7 @@ pub fn store_install(slug: &str) -> Result<Value, String> {
     };
     let _ = cmdline;
     let mut command = std::process::Command::new(&program);
-    command
-        .args(&args)
-        .stdin(std::process::Stdio::null());
+    command.args(&args).stdin(std::process::Stdio::null());
     #[cfg(windows)]
     crate::no_window(&mut command);
     let output = command
@@ -478,7 +560,11 @@ pub fn store_install(slug: &str) -> Result<Value, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        let detail = if stderr.trim().is_empty() { stdout.clone() } else { stderr };
+        let detail = if stderr.trim().is_empty() {
+            stdout.clone()
+        } else {
+            stderr
+        };
         return Ok(json!({ "success": false, "slug": trimmed, "output": truncate(&detail, 2000) }));
     }
     Ok(json!({ "success": true, "slug": trimmed, "output": truncate(&stdout, 2000) }))
@@ -544,6 +630,9 @@ mod tests {
         let raw = "---\nname: \"quoted\"\ndescription: 'single'\n---\nbody";
         let parsed = parse_frontmatter(raw);
         assert_eq!(parsed.get("name").map(String::as_str), Some("quoted"));
-        assert_eq!(parsed.get("description").map(String::as_str), Some("single"));
+        assert_eq!(
+            parsed.get("description").map(String::as_str),
+            Some("single")
+        );
     }
 }

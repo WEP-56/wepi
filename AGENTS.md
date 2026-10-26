@@ -55,9 +55,12 @@ Pi 调用工具 → 内置扩展 wepi-tools.ts → POST 127.0.0.1:<port>/tools�
 | `components/Steps.tsx` | 工具调用 / 思考步骤卡片 | 改工具过程展示 |
 | `components/Composer.tsx` | 输入框、附件、模型与思考档位、斜杠菜单 | 改输入区 |
 | `components/Markdown.tsx` | Markdown 渲染、代码块、链接拦截 | 改文本渲染 |
-| `components/RightPanel.tsx` | 右栏：标签页 + 文件树/预览/diff/终端/网页 + 宽度拖拽 | 改右栏；**1100+ 行，见 §5** |
+| `components/RightPanel.tsx` | 右栏：标签页 + 文件树/预览/diff/终端/网页 + 宽度拖拽 | 改右栏；**1200+ 行，见 §5** |
+| `components/ShowCards.tsx` | `show` 工具卡片：回合彻底结束后出现在最终回复下方 | 改预览入口卡片 |
+| `components/PreviewView.tsx` | 右栏「预览」标签：代码/图片/PDF/Office HTML（走 `show_preview`）；Office 失败给系统打开兜底 | 改本地产物预览 |
+| `components/OfficeHtmlView.tsx` | OfficeCLI HTML 的 sandbox iframe + 选区注入（段落/单元格/幻灯片） | 改 Office 预览/选区 |
 | `components/SimulatorView.tsx` | 模拟器面板（独立文件，作为新视图的范本） | 改模拟器 UI |
-| `components/Attachments.tsx` | 附件 chip（图片 / 文件 / 页面元素） | 加附件类型 |
+| `components/Attachments.tsx` | 附件 chip（图片 / 文件 / 页面元素 / Office 选区） | 加附件类型 |
 | `components/ApprovalCards.tsx` | 安全门审批卡 | 改审批交互 |
 | `components/TodoStrip.tsx` | 待办条 | 改 todo 展示 |
 | `components/kit.tsx` `ui.tsx` | 基础控件：`kit` 是 `Btn/Card/Field/Modal/PageShell/Segmented/Select/RenameInput`，`ui` 是 `IconBtn/Popover/MenuItem/Kbd/Toggle/AppIcon` | **新控件先加这里**，别就地搓 |
@@ -67,6 +70,8 @@ Pi 调用工具 → 内置扩展 wepi-tools.ts → POST 127.0.0.1:<port>/tools�
 | `lib/piEventReducer.ts` | **纯函数**归约器：RPC 事件 → `TurnBlock[]` | 改流式渲染逻辑 |
 | `lib/piSession.ts` | 会话 JSONL 读取与摘要 | 改历史会话 |
 | `lib/workspace.ts` | `workspace_request` 包装 + 路径/链接解析（`fileTarget`） | 改文件类调用 |
+| `lib/show.ts` | `show` 工具参数解析、卡片模型、`show_preview` 返回类型 | 改 show 卡片/预览 |
+| `lib/office.ts` | Office 选区类型、扩展名路由、chip 摘要 | 改 Office 选区/文件路由 |
 | `lib/attachments.ts` | 附件 → 提示词块 | 改附件如何进对话 |
 | `lib/piAdmin.ts` `slashCommands.ts` `extensionUi.ts` `fs.ts` | 管理页调用、斜杠命令、扩展 UI 桥、文件选择 | 对应功能 |
 
@@ -74,10 +79,12 @@ Pi 调用工具 → 内置扩展 wepi-tools.ts → POST 127.0.0.1:<port>/tools�
 
 | 路径 | 职责 |
 |---|---|
-| `lib.rs` | Pi 进程生命周期、RPC 归一化、会话扫描、命令注册、托盘；**1800 行，见 §5** |
+| `lib.rs` | Pi 进程生命周期、RPC 归一化、会话扫描、命令注册、托盘；**1900 行，见 §5** |
 | `workspace.rs` | 文件读写、git review/diff/提交、PTY 终端、子 webview（含网页元素拾取） |
+| `show.rs` | `show` 工具（目标校验/分类）+ `show_preview` 右栏预览（文本/图片/PDF；Office 转 OfficeCLI HTML） |
+| `office.rs` | OfficeCLI HTML 渲染、缓存、`WEPI_OFFICECLI` 发现；Office 选区只回 HTML，不转 PDF |
 | `simulator/` | 安卓模拟器：`mod.rs`（adb/截图/input/元素树）、`stream.rs`（取帧线程）、`tools.rs`（agent 工具）、`commands.rs`（面板 IPC） |
-| `bridge.rs` | 回环工具桥：`tools/list` + `tools/call`，Bearer + 拒 Origin |
+| `bridge.rs` | 回环工具桥：`tools/list` + `tools/call`（模拟器 + `show`），Bearer + 拒 Origin；`params.cwd` 供相对产物路径解析 |
 | `pi_mcp.rs` `pi_skills.rs` `pi_ext.rs` `pi_runtime.rs` | MCP 配置、Skill、扩展管理、Pi 安装与版本 |
 | `wepi_settings.rs` `wepi_security.rs` | 应用偏好（`~/.wepi/settings.json`）、安全门策略快照 |
 | `shell_open.rs` `tray.rs` `app_update.rs` `toml_lite.rs` | 打开外部程序、托盘、更新检查、极简 TOML |
@@ -102,6 +109,7 @@ Pi 调用工具 → 内置扩展 wepi-tools.ts → POST 127.0.0.1:<port>/tools�
 3. `RightPanel` 的渲染分支加 `{tab.kind === 'x' && <XView active={isActive} …/>}`。
 4. 视图组件**单独一个文件**（照抄 `SimulatorView.tsx` 的骨架：`active` 控制取帧循环、`notice` 显示错误）。
 5. 需要从别处（聊天里的链接、菜单）打开：走 `openKind` / `PanelTarget`，链接解析在 `workspace.ts::fileTarget`。
+6. 工作区外的产物（`show` 卡片、临时文件）走 `kind: 'preview'` + 绝对路径，由 `PreviewView` 调 `show_preview`；不要塞进 `files` 标签——`workspace_request` 有根目录约束。
 
 ### B. 加一个 agent 工具
 
@@ -118,6 +126,8 @@ Pi 调用工具 → 内置扩展 wepi-tools.ts → POST 127.0.0.1:<port>/tools�
   6. 失败要回 `isError` 结果（让模型看见并自我纠正），不要回 JSON-RPC error。
 
 写工具描述时把"单位、坐标系、副作用"写清楚——模型只靠这段文字决定怎么调。
+
+**前端控制类工具**（如 `show`）：工具只校验参数并返回摘要；卡片/预览从工具块参数重建（Pi 的 `toolResult` 只落 content，不落 `details`），真正的读取放到用户点击时的 IPC 命令里。相对路径靠扩展在 `tools/call` 里带的 `cwd` 解析。
 
 ### C. 加一个 Rust IPC 命令
 
@@ -172,17 +182,17 @@ pi-rpc-event → piEventReducer.applyPiEvent(state, event) → TurnBlock[]
 
 ## 5. 文件体量纪律（重要）
 
-**目标 ≤400 行，硬上限 600 行**（Rust 数据/协议类文件可到 800）。超了就拆，别等下次。
+不是硬上限，但最好**小于等于1000 行**（Rust 数据/协议类文件可超过）。超了及时拆，别等。
 
-当前超标名单（2026-10）：
+当前超标名单（2026-10，执行拆分后可去除，新达到的需加上）：
 
 | 文件 | 行数 | 拆分方向 |
 |---|---|---|
-| `src-tauri/src/lib.rs` | 1806 | `rpc/process.rs`（进程与握手）、`rpc/normalize.rs`（事件归一化）、`sessions.rs`（扫描/摘要）、`commands.rs`（命令注册） |
-| `src/App.tsx` | 1626 | `lib/store.ts`（`loadStore`/`usePersistedStore`）、`lib/threadMenu.ts`、`lib/sendTurn.ts`、`components/chat/*` |
-| `src/components/RightPanel.tsx` | 1118 | `components/rightpanel/{FilesView,DiffView,TerminalView,WebView}.tsx` + `index.tsx` 只留标签栏与布局 |
-| `src-tauri/src/simulator/mod.rs` | 1008 | `simulator/{adb,capture,input,tree}.rs`，`mod.rs` 只留类型与 re-export |
-| `src/data.ts` | 867 | `types/`（按域拆：chat / workspace / simulator）+ `seed/`（初始数据） |
+| `src-tauri/src/lib.rs` | 2056 | `rpc/process.rs`（进程与握手）、`rpc/normalize.rs`（事件归一化）、`sessions.rs`（扫描/摘要）、`commands.rs`（命令注册） |
+| `src/App.tsx` | 1732 | `lib/store.ts`（`loadStore`/`usePersistedStore`）、`lib/threadMenu.ts`、`lib/sendTurn.ts`、`components/chat/*` |
+| `src/components/RightPanel.tsx` | 1240 | `components/rightpanel/{FilesView,DiffView,TerminalView,WebView}.tsx` + `index.tsx` 只留标签栏与布局 |
+| `src-tauri/src/simulator/mod.rs` | 1085 | `simulator/{adb,capture,input,tree}.rs`，`mod.rs` 只留类型与 re-export |
+| `src/data.ts` | 906 | `types/`（按域拆：chat / workspace / simulator）+ `seed/`（初始数据） |
 
 规矩：
 
@@ -215,7 +225,12 @@ pi-rpc-event → piEventReducer.applyPiEvent(state, event) → TurnBlock[]
 - **`input text` 只吃可打印 ASCII**：中文得走输入法/剪贴板，别硬塞。
 - **面板取帧走模拟器控制台**（`adb emu screenrecord screenshot`，~210ms）而不是 `exec-out screencap`（~750ms）；老模拟器不支持时连续失败 5 次自动降级，日志里会出现一条 `[wepi] 模拟器控制台截图不可用`。
 - **子 webview 里的脚本不能抛异常**：`eval_with_callback` 会吞掉异常并回 `null`，注入脚本必须整体包 try/catch。
-- **`example/`** 是 pandacode 参考仓库，已 ignore，别提交、别依赖。
+- **Office 预览走 OfficeCLI HTML，不转 PDF**：`show_preview` 对 docx/pptx/xlsx 调 `officecli view <file> html`，前端用 sandbox iframe 渲染；选区靠 HTML 里的 `data-page`/`data-slide`/`data-path`，不依赖 Word/WPS/LibreOffice。OfficeCLI 缺失或格式不支持时回退「用系统应用打开」。
+- **OfficeCLI 选区不要同步截图**：`view screenshot --range` 实测 10–20 秒，会卡住点击；选区的 `data-path`/文本/页码已经足够 agent 定位，截图留给后续单独按钮。
+- **文件标签只做代码/文本**：`fileTarget`/`FilesView` 把 Office、PDF、图片路由到 `preview` 标签；不要在 `files` 标签里 `workspace_request('read')` 读二进制。
+- **文件树的 `entry.path` 是工作区相对路径**：转 `preview` 标签前必须用 workspace root 拼成绝对路径；`show_preview` 按进程 cwd 解析，否则会跑到 `src-tauri` 下找文件（`E:\WEPI\src-tauri\xxx.pdf`）。
+- **`show` 卡片从工具参数重建**：Pi 的 `toolResult` 只落 content，不落 `details`；卡片不要依赖 `details`，否则历史会话会丢卡片。
+- **`example/`** 是一系列参考仓库，已 ignore，别提交、别依赖。
 
 ## 8. 不要做的事
 

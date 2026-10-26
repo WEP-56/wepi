@@ -53,6 +53,7 @@ import { isSecurityConfirm, parseTodoWidgetLines, todoItemsFromSessionEntries, T
 import { DialogRequestCard, SecurityConfirmCard } from './components/ApprovalCards';
 import { TodoStrip } from './components/TodoStrip';
 import { fileTarget, workspace, type PanelTarget, type Review } from './lib/workspace';
+import type { ShowTarget } from './lib/show';
 import { shellApi, adminErrorMessage } from './lib/piAdmin';
 import {
   BUILTIN_COMMANDS,
@@ -75,7 +76,8 @@ import {
   type ComposerDraft,
   type PendingSend,
 } from './data';
-import { attachmentFromPath, attachmentPromptBlock, elementAttachment, ensureAttachmentPaths, forPersistence } from './lib/attachments';
+import { attachmentFromPath, attachmentPromptBlock, elementAttachment, ensureAttachmentPaths, forPersistence, officeAttachment } from './lib/attachments';
+import type { OfficeSelection } from './lib/office';
 
 interface NavState {
   view: ViewId;
@@ -518,6 +520,16 @@ export default function App() {
     });
   }, []);
 
+  const attachOffice = useCallback((selection: OfficeSelection) => {
+    // 和网页元素一样：选区是当前会话的上下文，不在会话页时不收。
+    if (viewRef.current !== 'home') {
+      showToast('先打开一个会话，再把文档选区加进消息');
+      return;
+    }
+    appendToDraft([officeAttachment(selection)]);
+    showToast('已加入输入框，补充修改要求后发送');
+  }, [appendToDraft, showToast]);
+
   const clearDraft = useCallback((key: string) => {
     setDrafts((all) => {
       if (!(key in all)) return all;
@@ -591,8 +603,31 @@ export default function App() {
   };
   const openChatLink = (href: string) => {
     const target = fileTarget(href);
-    if (target) { setPanelTarget({ ...target, n: Date.now() }); setRightOpen(true); return; }
+    if (target) {
+      // 文件标签能靠 workspace root 解析相对路径；预览标签直接把路径交给
+      // show_preview，必须先补成绝对路径，否则 office/pdf 链接会找不到文件。
+      let path = target.path;
+      if (path && (target.kind === 'preview' || target.kind === 'files')
+        && !/^(?:[a-z]:[\\/]|\\\\|\/)/i.test(path) && project?.path) {
+        path = `${project.path.replace(/[\\/]+$/, '')}\\${path.replace(/^[\\/]+/, '')}`;
+      }
+      setPanelTarget({ ...target, path, n: Date.now() });
+      setRightOpen(true);
+      return;
+    }
     window.open(href, '_blank', 'noopener,noreferrer');
+  };
+  /** show 卡片：网页走内置 WebView，本地产物走独立的预览标签。 */
+  const openShowTarget = (target: ShowTarget) => {
+    if (target.url) {
+      setPanelTarget({ kind: 'web', url: target.url, n: Date.now() });
+      setRightOpen(true);
+      return;
+    }
+    if (target.path) {
+      setPanelTarget({ kind: 'preview', path: target.path, n: Date.now() });
+      setRightOpen(true);
+    }
   };
   const expand = (pid: string | null) => {
     if (pid) setExpanded((e) => (e.includes(pid) ? e : [...e, pid]));
@@ -1560,6 +1595,7 @@ export default function App() {
                       onRenameCancel={() => setRenaming(null)}
                       onToast={showToast}
                       onOpenLink={openChatLink}
+                      onOpenShow={openShowTarget}
                     />
                   ) : (
                     <EmptyState project={project} rightOpen={rightOpen} onToggleRight={() => setRightOpen((o) => !o)} />
@@ -1635,6 +1671,7 @@ export default function App() {
                       }
                       appendToDraft([elementAttachment(element)]);
                     }}
+                    onAttachOffice={attachOffice}
                   />
                 )}
               </div>

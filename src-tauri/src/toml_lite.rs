@@ -26,7 +26,13 @@ pub fn parse_toml(raw: &str) -> Result<Value, String> {
                     continue;
                 }
                 let finished = pending.take().expect("刚刚还在收集");
-                insert_dotted(&mut root, &finished.table_path, &finished.key, Value::Array(finished.items), line_no)?;
+                insert_dotted(
+                    &mut root,
+                    &finished.table_path,
+                    &finished.key,
+                    Value::Array(finished.items),
+                    line_no,
+                )?;
                 continue;
             }
         }
@@ -56,7 +62,12 @@ pub fn parse_toml(raw: &str) -> Result<Value, String> {
                 insert_dotted(&mut root, &path, &key, Value::Array(items), line_no)?;
             }
             ArrayStartKind::Multiline(items) => {
-                pending = Some(PendingArray { table_path: path.clone(), key, items, open: true });
+                pending = Some(PendingArray {
+                    table_path: path.clone(),
+                    key,
+                    items,
+                    open: true,
+                });
             }
         }
     }
@@ -128,7 +139,11 @@ fn find_assignment(line: &str) -> Option<usize> {
     None
 }
 
-fn ensure_table(root: &mut Map<String, Value>, path: &[String], line_no: usize) -> Result<(), String> {
+fn ensure_table(
+    root: &mut Map<String, Value>,
+    path: &[String],
+    line_no: usize,
+) -> Result<(), String> {
     let mut cursor = root;
     for part in path {
         let entry = cursor
@@ -142,7 +157,11 @@ fn ensure_table(root: &mut Map<String, Value>, path: &[String], line_no: usize) 
     Ok(())
 }
 
-fn resolve_table<'a>(root: &'a mut Map<String, Value>, path: &[String], line_no: usize) -> Result<&'a mut Map<String, Value>, String> {
+fn resolve_table<'a>(
+    root: &'a mut Map<String, Value>,
+    path: &[String],
+    line_no: usize,
+) -> Result<&'a mut Map<String, Value>, String> {
     let mut cursor = root;
     for part in path {
         let entry = cursor
@@ -157,7 +176,13 @@ fn resolve_table<'a>(root: &'a mut Map<String, Value>, path: &[String], line_no:
 }
 
 /// 支持 `a.b.c = v` 的点分键（Codex 配置里偶有出现）。
-fn insert_dotted(root: &mut Map<String, Value>, table_path: &[String], dotted_key: &str, value: Value, line_no: usize) -> Result<(), String> {
+fn insert_dotted(
+    root: &mut Map<String, Value>,
+    table_path: &[String],
+    dotted_key: &str,
+    value: Value,
+    line_no: usize,
+) -> Result<(), String> {
     let parts: Vec<&str> = dotted_key
         .split('.')
         .map(str::trim)
@@ -235,7 +260,10 @@ fn classify_array(line_no: &usize, text: &str) -> Result<ArrayStartKind, String>
 }
 
 /// 从文本头部取一个「标量或嵌套值」：返回 (值, 剩余)。嵌套结构按配对括号截取。
-fn take_scalar_value<'a>(line_no: &usize, text: &'a str) -> Result<Option<(Value, &'a str)>, String> {
+fn take_scalar_value<'a>(
+    line_no: &usize,
+    text: &'a str,
+) -> Result<Option<(Value, &'a str)>, String> {
     let text = text.trim_start();
     if text.is_empty() {
         return Ok(None);
@@ -456,10 +484,16 @@ url = "https://example.com/mcp"
         let parsed = parse_toml(raw).expect("parse ok");
         assert_eq!(parsed["model"], json!("gpt-5"));
         assert_eq!(parsed["mcp_servers"]["fetch"]["command"], json!("npx"));
-        assert_eq!(parsed["mcp_servers"]["fetch"]["args"], json!(["-y", "fetch-mcp"]));
+        assert_eq!(
+            parsed["mcp_servers"]["fetch"]["args"],
+            json!(["-y", "fetch-mcp"])
+        );
         assert_eq!(parsed["mcp_servers"]["fetch"]["enabled"], json!(true));
         assert_eq!(parsed["mcp_servers"]["fetch"]["timeout"], json!(30));
-        assert_eq!(parsed["mcp_servers"]["search"]["url"], json!("https://example.com/mcp"));
+        assert_eq!(
+            parsed["mcp_servers"]["search"]["url"],
+            json!("https://example.com/mcp")
+        );
     }
 
     #[test]

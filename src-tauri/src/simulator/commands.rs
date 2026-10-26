@@ -7,7 +7,9 @@ use tauri::{ipc::Response, AppHandle, Manager};
 use super::{Input, Simulators};
 
 fn name_of(udid: &str) -> Result<String, String> {
-    super::avd(udid).map(str::to_owned).ok_or_else(|| "无效的模拟器 id".to_string())
+    super::avd(udid)
+        .map(str::to_owned)
+        .ok_or_else(|| "无效的模拟器 id".to_string())
 }
 
 #[tauri::command]
@@ -18,7 +20,10 @@ pub async fn simulator_status(app: AppHandle) -> Result<super::Status, String> {
 }
 
 #[tauri::command]
-pub async fn simulator_select(app: AppHandle, udid: Option<String>) -> Result<super::Status, String> {
+pub async fn simulator_select(
+    app: AppHandle,
+    udid: Option<String>,
+) -> Result<super::Status, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let sims = app.state::<Simulators>();
         sims.select(udid)?;
@@ -29,7 +34,11 @@ pub async fn simulator_select(app: AppHandle, udid: Option<String>) -> Result<su
 }
 
 #[tauri::command]
-pub async fn simulator_power(app: AppHandle, udid: String, on: bool) -> Result<super::Status, String> {
+pub async fn simulator_power(
+    app: AppHandle,
+    udid: String,
+    on: bool,
+) -> Result<super::Status, String> {
     let name = name_of(&udid)?;
     tauri::async_runtime::spawn_blocking(move || {
         let sims = app.state::<Simulators>();
@@ -54,7 +63,9 @@ pub async fn simulator_frame(app: AppHandle, udid: String, after: u64) -> Result
     let name = name_of(&udid)?;
     tauri::async_runtime::spawn_blocking(move || {
         let sims = app.state::<Simulators>();
-        let frame = sims.streams.next(&name, after, Duration::from_millis(1500))?;
+        let frame = sims
+            .streams
+            .next(&name, after, Duration::from_millis(1500))?;
         Ok(Response::new(frame.map_or_else(Vec::new, |frame| {
             let mut bytes = Vec::with_capacity(frame.jpeg.len() + 8);
             bytes.extend_from_slice(&frame.seq.to_le_bytes());

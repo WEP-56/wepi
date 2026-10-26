@@ -8,19 +8,21 @@ use std::{
     sync::{Arc, Condvar, Mutex, OnceLock},
     time::Duration,
 };
-mod workspace;
-mod bridge;
-mod simulator;
-mod pi_mcp;
-mod pi_skills;
-mod pi_ext;
-mod pi_runtime;
 mod app_update;
-mod toml_lite;
-mod wepi_settings;
-mod wepi_security;
+mod bridge;
+mod office;
+mod pi_ext;
+mod pi_mcp;
+mod pi_runtime;
+mod pi_skills;
 mod shell_open;
+mod show;
+mod simulator;
+mod toml_lite;
 mod tray;
+mod wepi_security;
+mod wepi_settings;
+mod workspace;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(windows)]
@@ -198,7 +200,10 @@ async fn pi_config_write(file: String, content: Value) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn pi_provider_models_fetch(url: String, headers: HashMap<String, String>) -> Result<Value, String> {
+async fn pi_provider_models_fetch(
+    url: String,
+    headers: HashMap<String, String>,
+) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let trimmed = url.trim();
         if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
@@ -208,7 +213,9 @@ async fn pi_provider_models_fetch(url: String, headers: HashMap<String, String>)
         for (key, value) in headers {
             request = request.set(&key, &value);
         }
-        let response = request.call().map_err(|error| format!("模型接口请求失败：{error}"))?;
+        let response = request
+            .call()
+            .map_err(|error| format!("模型接口请求失败：{error}"))?;
         response
             .into_json::<Value>()
             .map_err(|error| format!("模型接口返回的不是有效 JSON：{error}"))
@@ -321,7 +328,9 @@ fn scan_cache() -> &'static Mutex<HashMap<String, (u64, u64, Value)>> {
 fn scan_sessions_blocking() -> Result<Value, String> {
     let root = pi_sessions_dir();
     let mut sessions = Vec::new();
-    let mut cache = scan_cache().lock().map_err(|_| "扫描缓存锁定失败".to_owned())?;
+    let mut cache = scan_cache()
+        .lock()
+        .map_err(|_| "扫描缓存锁定失败".to_owned())?;
     let mut seen: Vec<String> = Vec::new();
     let dirs = fs::read_dir(&root).map_err(|e| format!("无法读取 Pi sessions 目录：{e}"))?;
     for dir in dirs.filter_map(Result::ok) {
@@ -351,7 +360,9 @@ fn scan_sessions_blocking() -> Result<Value, String> {
                 .unwrap_or(0);
             seen.push(key.clone());
             let summary = match cache.get(&key) {
-                Some((size, cached_mtime, value)) if *size == meta.len() && *cached_mtime == mtime_ms => {
+                Some((size, cached_mtime, value))
+                    if *size == meta.len() && *cached_mtime == mtime_ms =>
+                {
                     value.clone()
                 }
                 _ => {
@@ -577,12 +588,23 @@ fn normalize_rpc_record(record: Value) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .map(|delta| serde_json::json!({"type":"assistant_thinking_delta","delta":delta})),
             "thinking_end" => Some(serde_json::json!({"type":"assistant_thinking_end"})),
-            "toolcall_start" => Some(
-                serde_json::json!({"type":"tool_execution_start", "toolCallId": event.get("toolCallId").or_else(|| event.get("id")), "toolName": event.get("toolName").or_else(|| event.get("name")), "args": event.get("arguments").or_else(|| event.get("args"))}),
-            ),
-            "toolcall_end" => Some(
-                serde_json::json!({"type":"tool_execution_end", "toolCallId": event.get("toolCallId").or_else(|| event.get("id")), "toolName": event.get("toolName").or_else(|| event.get("name")), "result": event.get("result"), "isError": event.get("isError")}),
-            ),
+            "toolcall_start" => Some(serde_json::json!({
+                "type": "tool_execution_start",
+                "toolCallId": event.get("toolCallId").or_else(|| event.get("id")),
+                "toolName": event.get("toolName").or_else(|| event.get("name")),
+                // Pi 的 toolcall_start 把参数放在 toolCall.arguments 里；顶层没有 arguments。
+                "args": event
+                    .get("arguments")
+                    .or_else(|| event.get("args"))
+                    .or_else(|| event.get("toolCall").and_then(|tool| tool.get("arguments"))),
+            })),
+            // toolcall_end 只是「参数流结束」，不是工具执行结束；真正的结果
+            // 由 Pi 的 tool_execution_end 事件带回。别在这里伪造 result。
+            "toolcall_end" => Some(serde_json::json!({
+                "type": "tool_call_stream_end",
+                "toolCallId": event.get("toolCall").and_then(|tool| tool.get("id")),
+                "toolName": event.get("toolCall").and_then(|tool| tool.get("name")),
+            })),
             _ => None,
         };
         return mapped.map_or_else(|| vec![record], |event| vec![event]);
@@ -604,8 +626,13 @@ fn normalize_rpc_record(record: Value) -> Vec<Value> {
     }
     if matches!(
         kind,
-        "tool_execution_start" | "tool_execution_update" | "tool_execution_end"
-            | "turn_start" | "turn_end" | "agent_start" | "agent_end"
+        "tool_execution_start"
+            | "tool_execution_update"
+            | "tool_execution_end"
+            | "turn_start"
+            | "turn_end"
+            | "agent_start"
+            | "agent_end"
     ) {
         return vec![record];
     }
@@ -662,7 +689,12 @@ fn locate_node() -> Option<PathBuf> {
         candidates.push(PathBuf::from(path).join("nodejs").join("node.exe"));
     }
     if let Ok(path) = std::env::var("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(path).join("Programs").join("nodejs").join("node.exe"));
+        candidates.push(
+            PathBuf::from(path)
+                .join("Programs")
+                .join("nodejs")
+                .join("node.exe"),
+        );
     }
     if let Ok(path) = std::env::var("APPDATA") {
         candidates.push(PathBuf::from(path).join("npm").join("node.exe"));
@@ -791,7 +823,10 @@ const RUNTIME_EVENT_BATCH_MS: u64 = 16;
 const MAX_BUFFERED_EVENTS: usize = 128;
 
 fn push_coalesced(buffer: &mut Vec<Value>, event: Value) {
-    let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
+    let kind = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match kind {
         "assistant_text_delta" | "assistant_thinking_delta" => {
             let same_kind = buffer
@@ -799,10 +834,16 @@ fn push_coalesced(buffer: &mut Vec<Value>, event: Value) {
                 .and_then(|last| last.get("type").and_then(Value::as_str))
                 .is_some_and(|last_kind| last_kind == kind);
             if same_kind {
-                let delta = event.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if let Some(last) = buffer.last_mut() {
                     let merged = {
-                        let existing = last.get("delta").and_then(Value::as_str).unwrap_or_default();
+                        let existing = last
+                            .get("delta")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         format!("{existing}{delta}")
                     };
                     if let Some(obj) = last.as_object_mut() {
@@ -920,8 +961,12 @@ fn start_process_blocking(
                             if value.get("type").and_then(Value::as_str) == Some("response")
                                 && value.get("id").and_then(Value::as_str) == Some(handshake_id)
                             {
-                                let state = if value.get("success").and_then(Value::as_bool) == Some(true) {
-                                    HandshakeState::Done(value.get("data").cloned().unwrap_or(Value::Null))
+                                let state = if value.get("success").and_then(Value::as_bool)
+                                    == Some(true)
+                                {
+                                    HandshakeState::Done(
+                                        value.get("data").cloned().unwrap_or(Value::Null),
+                                    )
                                 } else {
                                     HandshakeState::Failed(
                                         value
@@ -1075,18 +1120,10 @@ async fn pi_rpc_start(
 /// 顺序说明：先写命令再等响应（而不是先等第一行输出）。真实 Pi 启动时
 /// 会输出初始化通知，但协议上不能依赖它——读取线程对 wepi-prepare 的
 /// 响应拦截在缓冲之外，命令先到也不会丢失。
-fn prepare_blocking(
-    slots: &Slots,
-    session_key: &str,
-    timeout: Duration,
-) -> Result<Value, String> {
+fn prepare_blocking(slots: &Slots, session_key: &str, timeout: Duration) -> Result<Value, String> {
     let (handshake, stderr_tail) = {
-        let guard = slots
-            .lock()
-            .map_err(|_| "RPC 状态锁定失败".to_owned())?;
-        let slot = guard
-            .get(session_key)
-            .ok_or("该会话的 Pi RPC 尚未启动")?;
+        let guard = slots.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?;
+        let slot = guard.get(session_key).ok_or("该会话的 Pi RPC 尚未启动")?;
         (slot.handshake.clone(), slot.stderr_tail.clone())
     };
     let deadline = std::time::Instant::now() + timeout;
@@ -1161,7 +1198,10 @@ async fn pi_rpc_wait_ready(
     timeout_ms: Option<u64>,
 ) -> Result<(), String> {
     let ready = {
-        let guard = state.slots.lock().map_err(|_| "RPC 状态锁定失败".to_owned())?;
+        let guard = state
+            .slots
+            .lock()
+            .map_err(|_| "RPC 状态锁定失败".to_owned())?;
         guard
             .get(&session_key)
             .ok_or("该会话的 Pi RPC 尚未启动")?
@@ -1278,7 +1318,11 @@ setTimeout(() => { if (!fed) { process.stderr.write('no command received\n'); pr
         let argument = script_path.to_string_lossy().into_owned();
         // build_pi_command 只支持 pi 形态；这里直接手动构造 node 命令。
         let mut command = Command::new(&executable);
-        command.arg(&argument).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .arg(&argument)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn fake pi");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -1290,7 +1334,9 @@ setTimeout(() => { if (!fed) { process.stderr.write('no command received\n'); pr
         let handshake_out = handshake.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if line.trim().is_empty() { continue; }
+                if line.trim().is_empty() {
+                    continue;
+                }
                 *ready_out.0.lock().unwrap() = true;
                 ready_out.1.notify_all();
                 let value: Value = serde_json::from_str(&line).expect("fake pi emits valid json");
@@ -1309,12 +1355,20 @@ setTimeout(() => { if (!fed) { process.stderr.write('no command received\n'); pr
         });
         slots.lock().unwrap().insert(
             key.clone(),
-            RpcSlot { child, stdin, ready, handshake, stderr_tail },
+            RpcSlot {
+                child,
+                stdin,
+                ready,
+                handshake,
+                stderr_tail,
+            },
         );
-        let data = prepare_blocking(&slots, &key, Duration::from_secs(10)).expect("handshake completes");
+        let data =
+            prepare_blocking(&slots, &key, Duration::from_secs(10)).expect("handshake completes");
         assert_eq!(data["sessionFile"], json!("/tmp/demo.jsonl"));
         // 二次 prepare：握手已完成，直接复用结果不再发命令。
-        let again = prepare_blocking(&slots, &key, Duration::from_secs(10)).expect("cached handshake");
+        let again =
+            prepare_blocking(&slots, &key, Duration::from_secs(10)).expect("cached handshake");
         assert_eq!(again["sessionFile"], json!("/tmp/demo.jsonl"));
         let _ = take_slot(&slots, &key);
         let _ = fs::remove_dir_all(&dir);
@@ -1339,7 +1393,11 @@ process.stdin.on('data', () => {
         let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
         let key = "prepare-fail".to_owned();
         let mut command = Command::new(node);
-        command.arg(&script_path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .arg(&script_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -1350,13 +1408,19 @@ process.stdin.on('data', () => {
         let handshake_out = handshake.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if line.trim().is_empty() { continue; }
+                if line.trim().is_empty() {
+                    continue;
+                }
                 *ready_out.0.lock().unwrap() = true;
                 ready_out.1.notify_all();
                 let value: Value = serde_json::from_str(&line).expect("valid json");
                 if value.get("id").and_then(Value::as_str) == Some("wepi-prepare") {
                     *handshake_out.0.lock().unwrap() = Some(HandshakeState::Failed(
-                        value.get("error").and_then(Value::as_str).unwrap_or("unknown").to_owned(),
+                        value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned(),
                     ));
                     handshake_out.1.notify_all();
                 }
@@ -1364,10 +1428,19 @@ process.stdin.on('data', () => {
         });
         slots.lock().unwrap().insert(
             key.clone(),
-            RpcSlot { child, stdin, ready, handshake, stderr_tail: Arc::new(Mutex::new(String::new())) },
+            RpcSlot {
+                child,
+                stdin,
+                ready,
+                handshake,
+                stderr_tail: Arc::new(Mutex::new(String::new())),
+            },
         );
         let error = prepare_blocking(&slots, &key, Duration::from_secs(10)).expect_err("must fail");
-        assert!(error.contains("no provider configured"), "error was: {error}");
+        assert!(
+            error.contains("no provider configured"),
+            "error was: {error}"
+        );
         let _ = take_slot(&slots, &key);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1385,14 +1458,8 @@ process.stdin.on('data', () => {
                 json!({"type":"message_update","assistantMessageEvent":{"type":"text_end"}}),
                 json!({"type":"assistant_text_end"}),
             ),
-            (
-                json!({"type":"turn_start"}),
-                json!({"type":"turn_start"}),
-            ),
-            (
-                json!({"type":"turn_end"}),
-                json!({"type":"turn_end"}),
-            ),
+            (json!({"type":"turn_start"}), json!({"type":"turn_start"})),
+            (json!({"type":"turn_end"}), json!({"type":"turn_end"})),
         ];
         for (input, expected) in cases {
             let out = normalize_rpc_record(input);
@@ -1435,10 +1502,22 @@ process.stdin.on('data', () => {
     #[test]
     fn separates_deltas_from_different_tools_and_event_boundaries() {
         let mut buffer = Vec::new();
-        push_coalesced(&mut buffer, json!({"type": "assistant_text_delta", "delta": "a"}));
-        push_coalesced(&mut buffer, json!({"type": "tool_execution_update", "toolCallId": "c1"}));
-        push_coalesced(&mut buffer, json!({"type": "tool_execution_update", "toolCallId": "c2"}));
-        push_coalesced(&mut buffer, json!({"type": "assistant_text_delta", "delta": "b"}));
+        push_coalesced(
+            &mut buffer,
+            json!({"type": "assistant_text_delta", "delta": "a"}),
+        );
+        push_coalesced(
+            &mut buffer,
+            json!({"type": "tool_execution_update", "toolCallId": "c1"}),
+        );
+        push_coalesced(
+            &mut buffer,
+            json!({"type": "tool_execution_update", "toolCallId": "c2"}),
+        );
+        push_coalesced(
+            &mut buffer,
+            json!({"type": "assistant_text_delta", "delta": "b"}),
+        );
         assert_eq!(buffer.len(), 4, "不同类型的增量不能被错误合并");
     }
 
@@ -1491,6 +1570,26 @@ process.stdin.on('data', () => {
     }
 
     #[test]
+    fn toolcall_start_keeps_tool_arguments() {
+        // 回归：toolcall_start 的参数在 toolCall.arguments 里。之前只读顶层
+        // arguments，show 这类不产生 tool_execution_update 的工具会永远
+        // 拿不到参数，前端也就无法从 args 重建预览卡片。
+        let events = normalize_rpc_record(json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_start",
+                "contentIndex": 0,
+                "id": "call_1",
+                "toolName": "show",
+                "toolCall": {"id": "call_1", "name": "show", "arguments": {"targets": ["a.pdf"]}}
+            }
+        }));
+        assert_eq!(events[0]["type"], json!("tool_execution_start"));
+        assert_eq!(events[0]["toolCallId"], json!("call_1"));
+        assert_eq!(events[0]["args"]["targets"][0], json!("a.pdf"));
+    }
+
+    #[test]
     fn every_normalized_event_carries_its_session_key() {
         // 回归：键必须在归一化之后打上。归一化会新建文本/思考事件对象，
         // 若提前打标，这些事件会丢掉会话键，前端按会话路由时会把整段
@@ -1535,10 +1634,10 @@ process.stdin.on('data', () => {
         fs::create_dir_all(&nested).unwrap();
         let inside = nested.join("s.jsonl");
         fs::write(&inside, "{}").unwrap();
-        let outside = root.parent().unwrap().join(format!(
-            "wepi-outside-{}.jsonl",
-            std::process::id()
-        ));
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("wepi-outside-{}.jsonl", std::process::id()));
         fs::write(&outside, "{}").unwrap();
 
         // 目录内 .jsonl：允许
@@ -1581,7 +1680,10 @@ async fn pi_mcp_import_scan() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn pi_mcp_import_apply(entries: Vec<(String, Value)>, overwrite: bool) -> Result<Value, String> {
+async fn pi_mcp_import_apply(
+    entries: Vec<(String, Value)>,
+    overwrite: bool,
+) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || pi_mcp::apply_import(entries, overwrite))
         .await
         .map_err(|e| e.to_string())?
@@ -1616,7 +1718,12 @@ async fn pi_skills_read(path: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn pi_skills_create(location_id: String, name: String, description: String, content: Option<String>) -> Result<Value, String> {
+async fn pi_skills_create(
+    location_id: String,
+    name: String,
+    description: String,
+    content: Option<String>,
+) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         pi_skills::create(&location_id, &name, &description, content.as_deref())
     })
@@ -1654,9 +1761,11 @@ async fn pi_skills_delete(path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn pi_skills_store_search(query: String, limit: Option<u32>) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || pi_skills::store_search(&query, limit.unwrap_or(50)))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        pi_skills::store_search(&query, limit.unwrap_or(50))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1833,11 +1942,25 @@ async fn shell_open_capabilities() -> Result<Value, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// `show` 卡片的右栏预览入口：文本/图片/PDF 直接读；Office 走 OfficeCLI 的 HTML。
+/// 路径可能在工作区外（agent 产出的临时文件），所以不走 workspace_request 的根目录约束。
+#[tauri::command]
+async fn show_preview(webview: tauri::Webview, path: String) -> Result<Value, String> {
+    // 子 webview 加载的是任意网页；预览会返回文件内容，必须只允许主窗口调用。
+    if webview.label() != "main" {
+        return Err("此网页无法访问本地预览".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || show::preview(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(RpcProcess::new()).manage(workspace::WorkspaceState::default())
+        .manage(RpcProcess::new())
+        .manage(workspace::WorkspaceState::default())
         .manage(simulator::Simulators::default())
         .setup(|app| {
             // 托盘图标 + 菜单（打开 / 退出）。失败不阻塞启动——托盘是
@@ -1907,14 +2030,26 @@ pub fn run() {
             shell_open_with_system,
             shell_open_in_vscode,
             shell_open_capabilities,
+            show_preview,
             wepi_security_snapshot,
             wepi_security_save,
             wepi_security_set_session_level,
             app_update::app_update_check,
             tray::close_behavior_get,
-            tray::close_behavior_set
-            ,workspace::workspace_request, workspace::terminal_start, workspace::terminal_write, workspace::terminal_resize, workspace::terminal_close, workspace::browser_control
-            ,simulator::commands::simulator_status, simulator::commands::simulator_select, simulator::commands::simulator_power, simulator::commands::simulator_frame, simulator::commands::simulator_input, simulator::commands::simulator_capture, simulator::commands::simulator_appearance
+            tray::close_behavior_set,
+            workspace::workspace_request,
+            workspace::terminal_start,
+            workspace::terminal_write,
+            workspace::terminal_resize,
+            workspace::terminal_close,
+            workspace::browser_control,
+            simulator::commands::simulator_status,
+            simulator::commands::simulator_select,
+            simulator::commands::simulator_power,
+            simulator::commands::simulator_frame,
+            simulator::commands::simulator_input,
+            simulator::commands::simulator_capture,
+            simulator::commands::simulator_appearance
         ])
         .run(tauri::generate_context!())
         .expect("error while running WEPI");

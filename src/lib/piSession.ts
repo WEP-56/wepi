@@ -216,9 +216,10 @@ export function projectPiEntries(entries: PiEntry[]): Message[] {
  */
 function demoteNarrations(blocks: TurnBlock[]): TurnBlock[] {
   // 找到最后一个 tool 块的位置；其后的 text 是回答，之前的 text 是叙述。
+  // show 是交付动作，不参与这个判定：模型可能先写最终回答再调用 show。
   let lastToolIndex = -1;
   blocks.forEach((block, index) => {
-    if (block.kind === 'tool') lastToolIndex = index;
+    if (block.kind === 'tool' && block.toolName !== 'show') lastToolIndex = index;
   });
   return blocks.map((block, index) => {
     if (block.kind !== 'text') return block;

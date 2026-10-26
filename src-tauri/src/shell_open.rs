@@ -60,7 +60,11 @@ pub fn show_in_explorer(path: &str) -> Result<(), String> {
         let _ = spawn_hidden(&mut command);
         return Ok(());
     }
-    let dir = if resolved.is_file() { resolved.parent().map(Path::to_path_buf).unwrap_or(resolved) } else { resolved };
+    let dir = if resolved.is_file() {
+        resolved.parent().map(Path::to_path_buf).unwrap_or(resolved)
+    } else {
+        resolved
+    };
     let mut command = if cfg!(target_os = "macos") {
         Command::new("open")
     } else {
@@ -80,14 +84,18 @@ pub fn open_with_system(path_or_url: &str) -> Result<(), String> {
     if cfg!(windows) {
         if is_url {
             // cmd /c start "" <url>：空标题参数避免把带 & 的 URL 截断。
-            let mut command = Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
+            let mut command =
+                Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
             command.raw_arg(format!("/D /C start \"\" {trimmed}"));
             return spawn_hidden(&mut command);
         }
         let resolved = resolve_existing(trimmed)?;
         // rundll url.dll 官方推荐的 shell 打开方式，等价于资源管理器双击。
         let mut command = Command::new("cmd");
-        command.raw_arg(format!("/D /C start \"\" \"{}\"", resolved.to_string_lossy()));
+        command.raw_arg(format!(
+            "/D /C start \"\" \"{}\"",
+            resolved.to_string_lossy()
+        ));
         return spawn_hidden(&mut command);
     }
     let mut command = if cfg!(target_os = "macos") {
@@ -142,14 +150,39 @@ fn find_code_binary() -> Option<PathBuf> {
     if cfg!(windows) {
         if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
             let localappdata = PathBuf::from(localappdata);
-            candidates.push(localappdata.join("Programs").join("Microsoft VS Code").join("bin").join("code.cmd"));
-            candidates.push(localappdata.join("Programs").join("Microsoft VS Code Insiders").join("bin").join("code.cmd"));
+            candidates.push(
+                localappdata
+                    .join("Programs")
+                    .join("Microsoft VS Code")
+                    .join("bin")
+                    .join("code.cmd"),
+            );
+            candidates.push(
+                localappdata
+                    .join("Programs")
+                    .join("Microsoft VS Code Insiders")
+                    .join("bin")
+                    .join("code.cmd"),
+            );
         }
         if let Ok(programfiles) = std::env::var("ProgramFiles") {
-            candidates.push(PathBuf::from(programfiles).join("Microsoft VS Code").join("bin").join("code.cmd"));
+            candidates.push(
+                PathBuf::from(programfiles)
+                    .join("Microsoft VS Code")
+                    .join("bin")
+                    .join("code.cmd"),
+            );
         }
     } else if cfg!(target_os = "macos") {
-        candidates.push(home.join("Applications").join("Visual Studio Code.app").join("Contents").join("Resources").join("app").join("bin").join("code"));
+        candidates.push(
+            home.join("Applications")
+                .join("Visual Studio Code.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app")
+                .join("bin")
+                .join("code"),
+        );
     } else {
         candidates.push(PathBuf::from("/usr/bin/code"));
         candidates.push(PathBuf::from("/usr/local/bin/code"));
@@ -170,7 +203,8 @@ pub fn open_in_vscode(path: &str) -> Result<(), String> {
     let display = binary.to_string_lossy().into_owned();
     // .cmd 垫片经 cmd.exe 包装（与 pi 命令同款约束）；exe/脚本直接数组传参。
     if cfg!(windows) && !display.to_ascii_lowercase().ends_with(".exe") {
-        let mut command = Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
+        let mut command =
+            Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
         command.raw_arg(format!(
             "/D /S /C \"{}\" \"{}\"",
             display.replace('"', ""),
@@ -210,6 +244,8 @@ mod tests {
     #[test]
     fn capabilities_report_code_detection() {
         let capabilities = open_capabilities();
-        assert!(capabilities.get("vscodeAvailable").is_some_and(Value::is_boolean));
+        assert!(capabilities
+            .get("vscodeAvailable")
+            .is_some_and(Value::is_boolean));
     }
 }

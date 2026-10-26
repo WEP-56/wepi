@@ -59,13 +59,17 @@ export default async function (pi: ExtensionAPI) {
 			description: tool.description,
 			parameters: tool.inputSchema,
 			async execute(_id: string, args: unknown, signal?: AbortSignal) {
-				const result = await request("tools/call", { name: tool.name, arguments: args ?? {} }, signal);
+				// cwd 用于解析 show 这类「相对会话工作目录」的产物路径；
+				// 工具块参数仍只保留模型原始参数，不会多出这个字段。
+				const result = await request("tools/call", { name: tool.name, arguments: args ?? {}, cwd: process.cwd() }, signal);
 				const content = Array.isArray(result?.content) ? (result.content as Content[]) : [];
 				if (result?.isError) {
 					const text = content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
 					throw new Error(text || "工具执行失败");
 				}
-				return { content, details: undefined };
+				// details 是否落盘取决于 Pi 版本；前端卡片只从参数重建，
+				// 这里转发是给未来需要结构化结果的工具留的口子。
+				return { content, details: result?.details };
 			},
 		});
 	}

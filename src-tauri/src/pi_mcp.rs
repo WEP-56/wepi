@@ -38,9 +38,17 @@ pub fn pi_agent_dir() -> PathBuf {
 fn layer_paths() -> Vec<(&'static str, PathBuf, bool)> {
     let home = home_dir();
     vec![
-        ("user-config", home.join(".config").join("mcp").join("mcp.json"), false),
+        (
+            "user-config",
+            home.join(".config").join("mcp").join("mcp.json"),
+            false,
+        ),
         ("agents", home.join(".agents").join("mcp.json"), false),
-        ("agents-dir", home.join(".agents").join("mcp").join("mcp.json"), false),
+        (
+            "agents-dir",
+            home.join(".agents").join("mcp").join("mcp.json"),
+            false,
+        ),
         ("pi-agent", pi_agent_dir().join("mcp.json"), true),
     ]
 }
@@ -61,8 +69,14 @@ pub fn is_valid_server_name(name: &str) -> bool {
 
 /// Pi 当前支持 stdio（command）和 streamable HTTP（url）。
 pub fn infer_transport(def: &Value) -> Option<&'static str> {
-    let has_command = def.get("command").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty());
-    let has_url = def.get("url").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty());
+    let has_command = def
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|v| !v.trim().is_empty());
+    let has_url = def
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|v| !v.trim().is_empty());
     match (has_command as u8 + has_url as u8) == 1 {
         true if has_command => Some("stdio"),
         true if has_url => Some("http"),
@@ -78,7 +92,10 @@ fn validate_server_definition(name: &str, definition: &Value) -> Result<(), Stri
         return Err(format!("服务器「{name}」需要恰好一个 command 或 url"));
     }
     if let Some(timeout) = definition.get("timeout") {
-        if !timeout.as_f64().is_some_and(|value| value > 0.0 && value.is_finite()) {
+        if !timeout
+            .as_f64()
+            .is_some_and(|value| value > 0.0 && value.is_finite())
+        {
             return Err(format!("服务器「{name}」的 timeout 必须是正数"));
         }
     }
@@ -136,7 +153,10 @@ struct MergedServer {
 }
 
 /// 按层级从低到高浅合并同名 server（PiDeck mergeMcpServers 的 Rust 移植）。
-fn merge_servers(layers: &[(String, Map<String, Value>)], writable_path: &str) -> Vec<(String, MergedServer)> {
+fn merge_servers(
+    layers: &[(String, Map<String, Value>)],
+    writable_path: &str,
+) -> Vec<(String, MergedServer)> {
     let mut merged: Vec<(String, MergedServer)> = Vec::new();
     for (path, servers) in layers {
         for (name, raw_def) in servers {
@@ -159,7 +179,8 @@ fn merge_servers(layers: &[(String, Map<String, Value>)], writable_path: &str) -
                             next.insert(key.clone(), value.clone());
                         }
                     }
-                    let touches_transport = infer_transport(raw_def).is_some() || has_any_transport(raw_def);
+                    let touches_transport =
+                        infer_transport(raw_def).is_some() || has_any_transport(raw_def);
                     if touches_transport {
                         entry.origin_path = path.clone();
                     }
@@ -175,7 +196,11 @@ fn merge_servers(layers: &[(String, Map<String, Value>)], writable_path: &str) -
 }
 
 fn has_any_transport(def: &Value) -> bool {
-    ["command", "url"].iter().any(|key| def.get(*key).and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty()))
+    ["command", "url"].iter().any(|key| {
+        def.get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.trim().is_empty())
+    })
 }
 
 fn load_layer(path: &Path) -> Option<Result<(String, Map<String, Value>, Vec<String>), String>> {
@@ -313,29 +338,53 @@ struct ImportSource {
 
 fn import_sources() -> Vec<ImportSource> {
     vec![
-        ImportSource { label: "Claude Desktop / CLI", path: home_file(".claude.json"), format: "json" },
-        ImportSource { label: "Claude MCP 合集", path: home_dir().join(".claude").join("mcp-configs").join("mcp-servers.json"), format: "json" },
-        ImportSource { label: "Codex", path: home_dir().join(".codex").join("config.toml"), format: "toml" },
+        ImportSource {
+            label: "Claude Desktop / CLI",
+            path: home_file(".claude.json"),
+            format: "json",
+        },
+        ImportSource {
+            label: "Claude MCP 合集",
+            path: home_dir()
+                .join(".claude")
+                .join("mcp-configs")
+                .join("mcp-servers.json"),
+            format: "json",
+        },
+        ImportSource {
+            label: "Codex",
+            path: home_dir().join(".codex").join("config.toml"),
+            format: "toml",
+        },
     ]
 }
 
 fn extract_vendor_servers(parsed: &Value, codex: bool) -> Vec<(String, Value)> {
     let key: &str = if codex { "mcp_servers" } else { "mcpServers" };
     if let Some(map) = parsed.get(key).and_then(Value::as_object) {
-        return map.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+        return map
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
     }
     if !codex {
         // 少数 Claude 导出是裸 map（顶层直接就是 server 名 → 定义）。
-        const TRANSPORT_KEYS: [&str; 7] = ["command", "url", "type", "args", "env", "headers", "oauth"];
+        const TRANSPORT_KEYS: [&str; 7] =
+            ["command", "url", "type", "args", "env", "headers", "oauth"];
         if let Some(map) = parsed.as_object() {
             let looks_bare = !map.is_empty()
                 && map.values().all(|value| {
                     value.as_object().is_some_and(|object| {
-                        TRANSPORT_KEYS.iter().any(|transport_key| object.contains_key(*transport_key))
+                        TRANSPORT_KEYS
+                            .iter()
+                            .any(|transport_key| object.contains_key(*transport_key))
                     })
                 });
             if looks_bare {
-                return map.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+                return map
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
             }
         }
     }
@@ -343,10 +392,20 @@ fn extract_vendor_servers(parsed: &Value, codex: bool) -> Vec<(String, Value)> {
 }
 
 /// 把 vendor 定义转换成 Pi 的 mcp.json 定义（PiDeck convertMcpDefinition 的简化移植）。
-fn convert_vendor_definition(raw: &Value, codex: bool, warnings: &mut Vec<String>) -> Option<Value> {
+fn convert_vendor_definition(
+    raw: &Value,
+    codex: bool,
+    warnings: &mut Vec<String>,
+) -> Option<Value> {
     let object = raw.as_object()?;
-    let command = object.get("command").and_then(Value::as_str).filter(|v| !v.trim().is_empty());
-    let url = object.get("url").and_then(Value::as_str).filter(|v| !v.trim().is_empty());
+    let command = object
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty());
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty());
     let transport_count = command.is_some() as u8 + url.is_some() as u8;
     if transport_count != 1 {
         warnings.push("需要恰好一个 command 或 url".to_owned());
@@ -356,14 +415,22 @@ fn convert_vendor_definition(raw: &Value, codex: bool, warnings: &mut Vec<String
     if let Some(command) = command {
         definition.insert("command".into(), Value::String(command.to_owned()));
         if let Some(args) = object.get("args").and_then(Value::as_array) {
-            let cleaned: Vec<Value> = args.iter().filter(|item| item.is_string()).cloned().collect();
+            let cleaned: Vec<Value> = args
+                .iter()
+                .filter(|item| item.is_string())
+                .cloned()
+                .collect();
             if cleaned.len() != args.len() {
                 warnings.push("部分参数不是字符串，已忽略".to_owned());
             }
             definition.insert("args".into(), Value::Array(cleaned));
         }
         if let Some(env) = object.get("env").and_then(Value::as_object) {
-            let cleaned: Map<String, Value> = env.iter().filter(|(_, v)| v.is_string()).map(|(k, v)| (k.clone(), v.clone())).collect();
+            let cleaned: Map<String, Value> = env
+                .iter()
+                .filter(|(_, v)| v.is_string())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             definition.insert("env".into(), Value::Object(cleaned));
         }
         if let Some(cwd) = object.get("cwd").and_then(Value::as_str) {
@@ -373,7 +440,11 @@ fn convert_vendor_definition(raw: &Value, codex: bool, warnings: &mut Vec<String
     if let Some(url) = url {
         definition.insert("url".into(), Value::String(url.to_owned()));
         if let Some(headers) = object.get("headers").and_then(Value::as_object) {
-            let cleaned: Map<String, Value> = headers.iter().filter(|(_, v)| v.is_string()).map(|(k, v)| (k.clone(), v.clone())).collect();
+            let cleaned: Map<String, Value> = headers
+                .iter()
+                .filter(|(_, v)| v.is_string())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             definition.insert("headers".into(), Value::Object(cleaned));
         }
         if let Some(oauth) = object.get("oauth").and_then(Value::as_object) {
@@ -430,7 +501,11 @@ pub fn scan_import() -> Result<Value, String> {
         for (name, raw_def) in servers {
             let mut warnings = Vec::new();
             let definition = convert_vendor_definition(&raw_def, codex, &mut warnings);
-            let blocker = if is_valid_server_name(&name) { None } else { Some("名称不符合 Pi 规范".to_owned()) };
+            let blocker = if is_valid_server_name(&name) {
+                None
+            } else {
+                Some("名称不符合 Pi 规范".to_owned())
+            };
             candidates.push(json!({
                 "name": name,
                 "sourceLabel": source.label,
@@ -530,14 +605,24 @@ pub fn probe_server(definition: &Value) -> Value {
     };
     match transport {
         "stdio" => {
-            let command = definition.get("command").and_then(Value::as_str).unwrap_or_default();
+            let command = definition
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             match find_on_path(command) {
-                Some(resolved) => json!({ "ok": true, "transport": "stdio", "detail": resolved.to_string_lossy() }),
-                None => json!({ "ok": false, "transport": "stdio", "error": format!("命令未找到：{command}") }),
+                Some(resolved) => {
+                    json!({ "ok": true, "transport": "stdio", "detail": resolved.to_string_lossy() })
+                }
+                None => {
+                    json!({ "ok": false, "transport": "stdio", "error": format!("命令未找到：{command}") })
+                }
             }
         }
         "http" => {
-            let url = definition.get("url").and_then(Value::as_str).unwrap_or_default();
+            let url = definition
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             match probe_http(url) {
                 Ok(detail) => json!({ "ok": true, "transport": "http", "detail": detail }),
                 Err(error) => json!({ "ok": false, "transport": "http", "error": error }),
@@ -577,7 +662,10 @@ fn probe_http(url: &str) -> Result<String, String> {
         .map_err(|e| format!("curl 启动失败：{e}（请确认已安装 curl）"))?;
     let status = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if status.is_empty() || !status.chars().all(|c| c.is_ascii_digit()) {
-        return Err(format!("无法获取 HTTP 状态（curl 退出码 {}）", output.status.code().unwrap_or(-1)));
+        return Err(format!(
+            "无法获取 HTTP 状态（curl 退出码 {}）",
+            output.status.code().unwrap_or(-1)
+        ));
     }
     let code: u16 = status.parse().map_err(|_| "HTTP 状态异常".to_owned())?;
     if (200..500).contains(&code) {
@@ -595,9 +683,15 @@ mod tests {
     #[test]
     fn accepts_only_pi_supported_transports() {
         assert_eq!(infer_transport(&json!({ "command": "npx" })), Some("stdio"));
-        assert_eq!(infer_transport(&json!({ "url": "https://example.com/mcp" })), Some("http"));
+        assert_eq!(
+            infer_transport(&json!({ "url": "https://example.com/mcp" })),
+            Some("http")
+        );
         assert_eq!(infer_transport(&json!({ "socket": "/tmp/mcp.sock" })), None);
-        assert_eq!(infer_transport(&json!({ "command": "npx", "url": "https://example.com" })), None);
+        assert_eq!(
+            infer_transport(&json!({ "command": "npx", "url": "https://example.com" })),
+            None
+        );
     }
 
     #[test]
@@ -606,14 +700,17 @@ mod tests {
             "docs",
             &json!({ "url": "https://example.com/mcp", "exposure": "deferred", "timeout": 30,
                 "toolExposure": { "search_*": "direct" } })
-        ).is_ok());
+        )
+        .is_ok());
         assert!(validate_server_definition(
             "docs",
             &json!({ "url": "https://example.com/mcp", "exposure": "invalid" })
-        ).is_err());
+        )
+        .is_err());
         assert!(validate_server_definition(
             "docs",
             &json!({ "url": "https://example.com/mcp", "timeout": 0 })
-        ).is_err());
+        )
+        .is_err());
     }
 }

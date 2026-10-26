@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Crosshair, ImageOff, X } from 'lucide-react';
+import { Crosshair, FileText, ImageOff, X } from 'lucide-react';
 import type { Attachment } from '../data';
 import { resolveImageSrc } from '../lib/attachments';
+import { officeSelectionSummary } from '../lib/office';
 import { cn } from '../utils/cn';
 
 /**
@@ -75,6 +76,40 @@ export function ElementChip({
     >
       <Crosshair size={12} className="shrink-0 text-[var(--blue)]" />
       <span className="max-w-[260px] truncate font-mono text-[var(--blue)]">{label}</span>
+      {onRemove && (
+        <button
+          type="button"
+          title="移除"
+          onClick={onRemove}
+          className="shrink-0 text-[var(--text-3)] hover:text-[var(--text)]"
+        >
+          <X size={11} />
+        </button>
+      )}
+    </span>
+  );
+}
+
+/** Office 选区 chip：草稿与已发消息共用。正文/定位在提示词里，chip 只展示位置与摘要。 */
+export function OfficeChip({
+  att,
+  onRemove,
+}: {
+  att: Attachment;
+  onRemove?: () => void;
+}) {
+  const selection = att.office;
+  const label = selection ? officeSelectionSummary(selection) : att.name;
+  const hint = selection
+    ? `${selection.path}\n${selection.pathHint ?? ''}\n${selection.text}`
+    : att.path || att.value;
+  return (
+    <span
+      title={hint}
+      className="flex max-w-full items-center gap-1.5 rounded-lg bg-[var(--bg-hover)] px-2 py-1 text-[12px]"
+    >
+      <FileText size={12} className="shrink-0 text-[var(--blue)]" />
+      <span className="max-w-[300px] truncate text-[var(--blue)]">{label}</span>
       {onRemove && (
         <button
           type="button"

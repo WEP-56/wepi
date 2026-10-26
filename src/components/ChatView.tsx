@@ -17,9 +17,11 @@ import type { Attachment, Message, Project, Thread, FileEdit, TurnBlock } from '
 import { ActivityTimeline, streamingLabelOf } from './ActivityView';
 import Markdown from './Markdown';
 import MessageNavigator from './MessageNavigator';
-import { AttachmentThumb, ElementChip, ImageViewer } from './Attachments';
+import { AttachmentThumb, ElementChip, ImageViewer, OfficeChip } from './Attachments';
+import ShowCards from './ShowCards';
 import { AppIcon, IconBtn } from './ui';
 import { RenameInput } from './kit';
+import { showRequests, type ShowTarget } from '../lib/show';
 import { cn } from '../utils/cn';
 
 function EditCard({ edits, onView, onToast }: { edits: FileEdit[]; onView: () => void; onToast: (s: string) => void }) {
@@ -78,11 +80,27 @@ function legacyBlocks(m: Message): TurnBlock[] {
   return blocks;
 }
 
-function AssistantMsgBase({ m, onView, onToast, onLink }: { m: Message; onView: () => void; onToast: (s: string) => void; onLink: (href: string) => void }) {
+function AssistantMsgBase({
+  m,
+  cwd,
+  onView,
+  onToast,
+  onLink,
+  onOpenShow,
+}: {
+  m: Message;
+  cwd?: string | null;
+  onView: () => void;
+  onToast: (s: string) => void;
+  onLink: (href: string) => void;
+  onOpenShow: (target: ShowTarget) => void;
+}) {
   const [copied, setCopied] = useState(false);
   const blocks = m.blocks ?? legacyBlocks(m);
   const streaming = !!m.streaming;
   const label = streaming ? streamingLabelOf(blocks) : null;
+  // show 卡片只在回合彻底结束后出现；流式期间工具行已经在时间线里了。
+  const shows = streaming ? [] : showRequests(blocks, cwd);
   // 正文 = 非 narration 的 text 块；narration（过程叙述）由时间线呈现。
   const isNarration = (b: TurnBlock) => b.kind === 'text' && (b as Extract<TurnBlock, { kind: 'text' }> & { narration?: boolean }).narration === true;
   const bodyBlocks = blocks.filter((b) => !isNarration(b));
@@ -118,6 +136,7 @@ function AssistantMsgBase({ m, onView, onToast, onLink }: { m: Message; onView: 
       )}
 
       {m.edits && !streaming && <EditCard edits={m.edits} onView={onView} onToast={onToast} />}
+      {shows.length > 0 && <ShowCards requests={shows} onOpen={onOpenShow} onToast={onToast} />}
       {!streaming && (
         <div className="mt-2 flex items-center gap-1 text-[var(--text-3)] opacity-0 transition-opacity group-hover/msg:opacity-100">
           <button
@@ -141,7 +160,7 @@ function AssistantMsgBase({ m, onView, onToast, onLink }: { m: Message; onView: 
  * 保持对象标识，因此历史消息可以整段跳过 Markdown 解析与 DOM diff。
  * 回调（onView/onToast）行为恒定，不参与比较。
  */
-const AssistantMsg = memo(AssistantMsgBase, (prev, next) => prev.m === next.m);
+const AssistantMsg = memo(AssistantMsgBase, (prev, next) => prev.m === next.m && prev.cwd === next.cwd);
 
 export function EmptyState({ project, rightOpen, onToggleRight }: { project: Project | null; rightOpen: boolean; onToggleRight: () => void }) {
   return (
@@ -179,6 +198,7 @@ export default function ChatView({
   onRenameCancel,
   onToast,
   onOpenLink,
+  onOpenShow,
 }: {
   thread: Thread;
   project: Project | null;
@@ -191,6 +211,7 @@ export default function ChatView({
   onRenameCancel: () => void;
   onToast: (s: string) => void;
   onOpenLink: (href: string) => void;
+  onOpenShow: (target: ShowTarget) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const moreRef = useRef<HTMLButtonElement>(null);
@@ -290,6 +311,9 @@ export default function ChatView({
     else msgEls.current.delete(id);
   };
 
+  // show 工具里的相对路径按会话 cwd 解析；历史会话没有 rpcKey 时用项目目录兜底。
+  const showCwd = thread.piCwd ?? project?.path ?? null;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-[52px] shrink-0 items-center gap-2 border-b border-[var(--border)] px-4">
@@ -330,7 +354,14 @@ export default function ChatView({
               if (m.role !== 'user') {
                 return (
                   <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-5 scroll-mt-24">
-                    <AssistantMsg m={m} onView={onViewChanges} onToast={onToast} onLink={onOpenLink} />
+                    <AssistantMsg
+                      m={m}
+                      cwd={showCwd}
+                      onView={onViewChanges}
+                      onToast={onToast}
+                      onLink={onOpenLink}
+                      onOpenShow={onOpenShow}
+                    />
                   </div>
                 );
               }
@@ -338,6 +369,7 @@ export default function ChatView({
               const images = atts.filter((att) => att.kind === 'image');
               const files = atts.filter((att) => att.kind === 'file');
               const elements = atts.filter((att) => att.kind === 'element');
+              const offices = atts.filter((att) => att.kind === 'office');
               return (
                 <div key={m.id} ref={setMsgRef(m.id)} className="fade-in my-6 flex scroll-mt-24 justify-end">
                   <div className="group/u flex max-w-[78%] flex-col items-end">
@@ -360,8 +392,11 @@ export default function ChatView({
                         ))}
                       </div>
                     )}
-                    {(files.length > 0 || elements.length > 0) && (
+                    {(files.length > 0 || elements.length > 0 || offices.length > 0) && (
                       <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+                        {offices.map((att) => (
+                          <OfficeChip key={att.id} att={att} />
+                        ))}
                         {files.map((att) => (
                           <span
                             key={att.id}

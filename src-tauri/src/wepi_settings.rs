@@ -46,7 +46,9 @@ fn cache() -> &'static Mutex<Option<Value>> {
 }
 
 pub fn read() -> Value {
-    let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.is_none() {
         *guard = Some(load());
     }
@@ -54,7 +56,9 @@ pub fn read() -> Value {
 }
 
 pub fn patch(mutator: impl FnOnce(&mut Value)) -> Result<Value, String> {
-    let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut current = guard.clone().unwrap_or_else(|| json!({}));
     if !current.is_object() {
         current = json!({});
@@ -90,10 +94,11 @@ pub fn add_custom_pi_path(path: &str) -> Result<(), String> {
             .expect("patch 前已保证为对象")
             .entry("customPiPaths")
             .or_insert_with(|| json!([]));
-        if !list
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(normalized.as_str())))
-        {
+        if !list.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str() == Some(normalized.as_str()))
+        }) {
             if let Some(items) = list.as_array_mut() {
                 items.push(json!(normalized));
             }
@@ -105,7 +110,10 @@ pub fn add_custom_pi_path(path: &str) -> Result<(), String> {
 pub fn remove_custom_pi_path(path: &str) -> Result<(), String> {
     let normalized = path.trim().to_owned();
     patch(|settings| {
-        if let Some(list) = settings.get_mut("customPiPaths").and_then(Value::as_array_mut) {
+        if let Some(list) = settings
+            .get_mut("customPiPaths")
+            .and_then(Value::as_array_mut)
+        {
             list.retain(|item| item.as_str() != Some(normalized.as_str()));
         }
     })

@@ -180,8 +180,19 @@ export function applyPiEvent(state: PiTurnState, event: PiRpcEvent, now: number)
       const id = typeof event.toolCallId === 'string' ? event.toolCallId : nextBlockId('tool');
       const toolName = typeof event.toolName === 'string' ? event.toolName : 'tool';
       const exists = state.blocks.some((block) => block.kind === 'tool' && block.id === id);
+      // toolcall_start 先建了行，但那时只有 toolCall 元数据；真正的 arguments
+      // 要等这里补上，否则 show 这类不产生 update 的工具永远拿不到参数。
       const blocks = exists
-        ? state.blocks.map((block) => (block.kind === 'tool' && block.id === id ? { ...block, running: true } : block))
+        ? state.blocks.map((block) =>
+            block.kind === 'tool' && block.id === id
+              ? {
+                  ...block,
+                  running: true,
+                  toolName: typeof event.toolName === 'string' ? event.toolName : block.toolName,
+                  args: event.arguments ?? event.args ?? block.args,
+                }
+              : block,
+          )
         : [...state.blocks, { kind: 'tool' as const, id, toolName, args: event.arguments ?? event.args, running: true }];
       // 本 turn 出现工具 → turn_end 时前面的 text 全部按叙述处理。
       return { ...state, blocks, streaming: true, turnHasTools: true };
@@ -276,11 +287,17 @@ export function applyPiEvent(state: PiTurnState, event: PiRpcEvent, now: number)
 /**
  * 判断某个 text 块是否「最终回答」：它后面不再有工具块。
  * turn_end 时前面的叙述据此与最终回答区分。
+ *
+ * `show` 是交付动作而不是工作步骤：模型完全可能在写完最终回答后
+ * 才调用它。若把 show 当成普通工具，最终回答会被错误降级成叙述，
+ * 正文区域反而空了。
  */
 function isFinalTurnText(state: PiTurnState, block: TurnBlock): boolean {
   const index = state.blocks.indexOf(block);
   if (index < 0) return true;
-  return !state.blocks.slice(index + 1).some((later) => later.kind === 'tool');
+  return !state.blocks
+    .slice(index + 1)
+    .some((later) => later.kind === 'tool' && later.toolName !== 'show');
 }
 
 /** 回合结束后用于正文展示的 text：只取非 narration 块。 */

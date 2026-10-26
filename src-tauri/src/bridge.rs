@@ -11,12 +11,16 @@ use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{atomic::{AtomicU64, Ordering}, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 
+use crate::show;
 use crate::simulator::{tools as simulator_tools, Simulators};
 
 const HEADER_LIMIT: usize = 8 * 1024;
@@ -41,14 +45,21 @@ pub fn endpoint(app: &AppHandle) -> Option<(String, String)> {
 
 fn token() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|time| time.as_nanos()).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_nanos())
+        .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:x}{:x}{seq:x}", std::process::id())
 }
 
 fn start(app: &AppHandle) -> Result<Endpoint, String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| format!("工具桥端口绑定失败：{error}"))?;
-    let authority = listener.local_addr().map_err(|error| error.to_string())?.to_string();
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("工具桥端口绑定失败：{error}"))?;
+    let authority = listener
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .to_string();
     let token = token();
     let worker_token = token.clone();
     let app = app.clone();
@@ -62,7 +73,10 @@ fn start(app: &AppHandle) -> Result<Endpoint, String> {
             thread::spawn(move || handle(stream, &app, &token));
         }
     });
-    Ok(Endpoint { url: format!("http://{authority}/tools"), token })
+    Ok(Endpoint {
+        url: format!("http://{authority}/tools"),
+        token,
+    })
 }
 
 fn handle(mut stream: TcpStream, app: &AppHandle, token: &str) {
@@ -113,16 +127,27 @@ fn read_request(stream: &mut TcpStream, token: &str) -> Result<Vec<u8>, u16> {
     let mut lines = header.split("\r\n");
     let request = lines.next().ok_or(400u16)?;
     let mut parts = request.split(' ');
-    if parts.next() != Some("POST") || parts.next() != Some("/tools") || parts.next() != Some("HTTP/1.1") || parts.next().is_some() {
+    if parts.next() != Some("POST")
+        || parts.next() != Some("/tools")
+        || parts.next() != Some("HTTP/1.1")
+        || parts.next().is_some()
+    {
         return Err(400);
     }
     let mut headers = std::collections::HashMap::new();
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').ok_or(400u16)?;
-        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
             return Err(400);
         }
-        if headers.insert(name.to_ascii_lowercase(), value.trim().to_owned()).is_some() {
+        if headers
+            .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+            .is_some()
+        {
             return Err(400);
         }
     }
@@ -133,13 +158,19 @@ fn read_request(stream: &mut TcpStream, token: &str) -> Result<Vec<u8>, u16> {
     if headers.get("authorization").map(String::as_str) != Some(&format!("Bearer {token}")) {
         return Err(401);
     }
-    if headers.get("content-type").is_none_or(|value| value.split(';').next().unwrap_or_default().trim() != "application/json") {
+    if headers.get("content-type").is_none_or(|value| {
+        value.split(';').next().unwrap_or_default().trim() != "application/json"
+    }) {
         return Err(400);
     }
     if headers.contains_key("transfer-encoding") || headers.contains_key("expect") {
         return Err(400);
     }
-    let length: usize = headers.get("content-length").ok_or(400u16)?.parse().map_err(|_| 400u16)?;
+    let length: usize = headers
+        .get("content-length")
+        .ok_or(400u16)?
+        .parse()
+        .map_err(|_| 400u16)?;
     if length > BODY_LIMIT {
         return Err(413);
     }
@@ -149,7 +180,9 @@ fn read_request(stream: &mut TcpStream, token: &str) -> Result<Vec<u8>, u16> {
     }
     let received = bytes.len();
     bytes.resize(expected, 0);
-    stream.read_exact(&mut bytes[received..]).map_err(|_| 400u16)?;
+    stream
+        .read_exact(&mut bytes[received..])
+        .map_err(|_| 400u16)?;
     Ok(bytes[header_end..].to_vec())
 }
 
@@ -161,8 +194,15 @@ fn write_status(stream: &mut TcpStream, status: u16) -> std::io::Result<()> {
         413 => "Payload Too Large",
         _ => "Error",
     };
-    let header = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let header =
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     stream.write_all(header.as_bytes())
+}
+
+fn catalog() -> Vec<Value> {
+    let mut tools = simulator_tools::catalog();
+    tools.extend(show::catalog());
+    tools
 }
 
 fn respond(app: &AppHandle, request: &Value) -> Value {
@@ -174,30 +214,42 @@ fn respond(app: &AppHandle, request: &Value) -> Value {
         "tools/list" => json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": { "server": SERVER_NAME, "tools": simulator_tools::catalog() }
+            "result": { "server": SERVER_NAME, "tools": catalog() }
         }),
         "tools/call" => {
             let name = request["params"]["name"].as_str().unwrap_or_default();
-            let args = request["params"].get("arguments").cloned().unwrap_or_else(|| json!({}));
-            let known = simulator_tools::catalog().iter().any(|tool| tool["name"] == name);
+            let args = request["params"]
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            // Pi 扩展运行在会话进程里，`cwd` 是解析相对产物路径的唯一可靠来源。
+            let cwd = request["params"].get("cwd").and_then(Value::as_str);
+            let known = catalog().iter().any(|tool| tool["name"] == name);
             if !known {
                 return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "Unknown tool" } });
             }
             // 工具自身的失败是「结果」而不是协议错误：模型要看到错误文本才能自己纠正。
-            let result = match call(app, name, &args) {
+            let result = match call(app, name, &args, cwd) {
                 Ok(result) => result,
-                Err(message) => json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
+                Err(message) => {
+                    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
+                }
             };
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
         }
-        _ => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Method not found" } }),
+        _ => {
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Method not found" } })
+        }
     }
 }
 
-fn call(app: &AppHandle, name: &str, args: &Value) -> Result<Value, String> {
+fn call(app: &AppHandle, name: &str, args: &Value, cwd: Option<&str>) -> Result<Value, String> {
     if name.starts_with("wepi_simulator_") {
         let sims = app.state::<Simulators>();
         return simulator_tools::dispatch(&sims, name, args);
+    }
+    if name == "show" {
+        return show::dispatch(name, args, cwd);
     }
     Err(format!("Unknown tool: {name}"))
 }
@@ -229,20 +281,40 @@ mod tests {
     fn wrong_token_origin_method_and_type_are_refused() {
         assert_eq!(ask(b"POST /tools HTTP/1.1\r\nAuthorization: Bearer other\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").unwrap_err(), 401);
         assert_eq!(ask(b"POST /tools HTTP/1.1\r\nOrigin: https://evil.test\r\nAuthorization: Bearer secret\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").unwrap_err(), 403);
-        assert_eq!(ask(b"GET /tools HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Length: 0\r\n\r\n").unwrap_err(), 400);
+        assert_eq!(
+            ask(
+                b"GET /tools HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Length: 0\r\n\r\n"
+            )
+            .unwrap_err(),
+            400
+        );
         assert_eq!(ask(b"POST /other HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").unwrap_err(), 400);
         assert_eq!(ask(b"POST /tools HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{}").unwrap_err(), 400);
         assert_eq!(ask(b"POST /tools HTTP/1.1\r\nAuthorization: Bearer secret\r\nContent-Type: application/json\r\nContent-Length: 999999\r\n\r\n").unwrap_err(), 413);
     }
 
     #[test]
-    fn the_catalog_covers_every_simulator_tool() {
-        let catalog = simulator_tools::catalog();
-        let names: Vec<&str> = catalog.iter().filter_map(|tool| tool["name"].as_str()).collect();
-        assert_eq!(names.len(), 5, "{names:?}");
-        assert!(names.iter().all(|name| name.starts_with("wepi_simulator_")));
-        assert!(names.contains(&"wepi_simulator_control") && names.contains(&"wepi_simulator_manage"));
+    fn the_catalog_covers_simulator_and_show_tools() {
+        let catalog = catalog();
+        let names: Vec<&str> = catalog
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 6, "{names:?}");
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("wepi_simulator_"))
+                .count(),
+            5
+        );
+        assert!(
+            names.contains(&"wepi_simulator_control") && names.contains(&"wepi_simulator_manage")
+        );
+        assert!(names.contains(&"show"));
         // 每个工具的 schema 都要有根类型，否则 Pi 侧无法校验参数。
-        assert!(catalog.iter().all(|tool| tool["inputSchema"]["type"] == "object"));
+        assert!(catalog
+            .iter()
+            .all(|tool| tool["inputSchema"]["type"] == "object"));
     }
 }

@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   Crosshair,
+  Eye,
   FileCode2,
   FileDiff,
   Files,
@@ -39,7 +40,9 @@ import {
 } from '../lib/workspace';
 import { isDesktopRuntime } from '../lib/piRpc';
 import type { BrowserElement } from '../data';
+import { isPreviewOnlyPath, type OfficeSelection } from '../lib/office';
 import SimulatorView from './SimulatorView';
+import PreviewView from './PreviewView';
 import '@xterm/xterm/css/xterm.css';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -55,8 +58,8 @@ interface Tab {
   line?: number;
 }
 
-const titles: Record<TabKind, string> = { new: '新标签页', files: '文件', diff: '变更', terminal: '终端', web: '网页', simulator: '模拟器' };
-const icons: Record<TabKind, typeof Globe> = { new: Globe, files: Files, diff: FileDiff, terminal: SquareTerminal, web: Globe, simulator: Smartphone };
+const titles: Record<TabKind, string> = { new: '新标签页', files: '文件', diff: '变更', terminal: '终端', web: '网页', simulator: '模拟器', preview: '预览' };
+const icons: Record<TabKind, typeof Globe> = { new: Globe, files: Files, diff: FileDiff, terminal: SquareTerminal, web: Globe, simulator: Smartphone, preview: Eye };
 const tools: { kind: TabKind; label: string; key: string; Icon: typeof Globe }[] = [
   { kind: 'diff', label: '变更', key: 'Ctrl+Shift+G', Icon: FileDiff },
   { kind: 'files', label: '文件', key: 'Ctrl+P', Icon: Files },
@@ -235,7 +238,17 @@ function Preview({ value, line }: { value: FilePreview | null; line?: number }) 
   );
 }
 
-function FilesView({ root, tab, onTarget }: { root: string; tab: Tab; onTarget: (target: PanelTarget) => void }) {
+function FilesView({
+  root,
+  tab,
+  onTarget,
+  onPreview,
+}: {
+  root: string;
+  tab: Tab;
+  onTarget: (target: PanelTarget) => void;
+  onPreview: (path: string) => void;
+}) {
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [selected, setSelected] = useState<string | undefined>(tab.path);
   const [error, setError] = useState('');
@@ -253,11 +266,29 @@ function FilesView({ root, tab, onTarget }: { root: string; tab: Tab; onTarget: 
     [root],
   );
 
+  // 文件树的 entry.path 是工作区相对路径；预览标签直接调 show_preview，
+  // 它按进程 cwd 解析相对路径，所以这里必须先拼成绝对路径。
+  const absolutePath = useCallback(
+    (path: string) => {
+      if (/^(?:[a-z]:[\\/]|\\\\|\/)/i.test(path) || !root) return path;
+      return `${root.replace(/[\\/]+$/, '')}\\${path.replace(/^[\\/]+/, '').replace(/\//g, '\\')}`;
+    },
+    [root],
+  );
+
   const open = useCallback(
     async (entry: FileEntry) => {
       const path = relativePath(entry.path);
       setSelected(entry.path);
       loaded.current = path;
+      // 文件标签只做代码/文本浏览；Office、PDF、图片交给预览标签，
+      // 否则这里的 read 会把二进制当文本读，既慢又会落到「二进制文件」占位。
+      if (isPreviewOnlyPath(entry.path)) {
+        setPreview(null);
+        setError('');
+        onPreview(absolutePath(entry.path));
+        return;
+      }
       try {
         const next = await workspace<FilePreview>('read', root, { path });
         setPreview(next);
@@ -269,7 +300,7 @@ function FilesView({ root, tab, onTarget }: { root: string; tab: Tab; onTarget: 
         setError(errorText(cause));
       }
     },
-    [onTarget, relativePath, root, tab.line],
+    [absolutePath, onPreview, onTarget, relativePath, root, tab.line],
   );
 
   // 会话里的文件链接（可能带 :行号）打开时同步预览；这里不再创建新标签页。
@@ -278,6 +309,11 @@ function FilesView({ root, tab, onTarget }: { root: string; tab: Tab; onTarget: 
     const path = relativePath(tab.path);
     if (loaded.current === path) return;
     loaded.current = path;
+    if (isPreviewOnlyPath(tab.path)) {
+      setPreview(null);
+      setError('该文件请在预览标签页查看');
+      return;
+    }
     void workspace<FilePreview>('read', root, { path })
       .then((next) => {
         setPreview(next);
@@ -1036,6 +1072,7 @@ export default function RightPanel({
   workspaceRoot,
   target,
   onAttachElement,
+  onAttachOffice,
 }: {
   onClose: () => void;
   openKind: { kind: TabKind; n: number; reviewId?: string } | null;
@@ -1047,11 +1084,28 @@ export default function RightPanel({
   target?: PanelTarget | null;
   /** 网页标签里拾取到的元素：交给上层附加到当前草稿。 */
   onAttachElement?: (element: BrowserElement) => void;
+  /** Office 预览里选中的段落/单元格：交给上层附加到当前草稿。 */
+  onAttachOffice?: (selection: OfficeSelection) => void;
 }) {
   const [tabs, setTabs] = useState<Tab[]>([{ id: 't0', kind: 'new' }]);
   const [active, setActive] = useState('t0');
+  // open 被 effect 调用，不能依赖 tabs（会反复重建 effect）；用 ref 读最新标签。
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
 
   const open = useCallback((kind: TabKind, data: Partial<Tab> = {}) => {
+    // 同一个文件/URL 重复点击卡片时聚焦已有标签，而不是堆出一排一样的页。
+    const existing = data.path || data.url
+      ? tabsRef.current.find((tab) => tab.kind === kind && (data.path ? tab.path === data.path : tab.url === data.url))
+      : undefined;
+    if (existing) {
+      // 同一文件的不同行号仍要跳转，否则点击 `file.ts:20` 会停在旧行。
+      if (data.line !== undefined && existing.line !== data.line) {
+        setTabs((old) => old.map((tab) => (tab.id === existing.id ? { ...tab, line: data.line } : tab)));
+      }
+      setActive(existing.id);
+      return;
+    }
     const id = `t${sequence++}`;
     setTabs((old) => [...old, { id, kind, ...data }]);
     setActive(id);
@@ -1087,7 +1141,12 @@ export default function RightPanel({
         <div className="scroll-thin flex min-w-0 flex-1 gap-1 overflow-x-auto">
           {tabs.map((tab) => {
             const Icon = icons[tab.kind];
-            const name = tab.kind === 'files' && tab.path ? basename(tab.path) : tab.kind === 'web' && tab.url ? tab.url : titles[tab.kind];
+            const name =
+              (tab.kind === 'files' || tab.kind === 'preview') && tab.path
+                ? basename(tab.path)
+                : tab.kind === 'web' && tab.url
+                  ? tab.url
+                  : titles[tab.kind];
             return (
               <div
                 key={tab.id}
@@ -1161,7 +1220,15 @@ export default function RightPanel({
                 </div>
               )}
               {tab.kind === 'files' && (
-                <FilesView root={workspaceRoot ?? ''} tab={tab} onTarget={(next) => update(tab.id, { path: next.path, line: next.line })} />
+                <FilesView
+                  root={workspaceRoot ?? ''}
+                  tab={tab}
+                  onTarget={(next) => update(tab.id, { path: next.path, line: next.line })}
+                  onPreview={(path) => open('preview', { path })}
+                />
+              )}
+              {tab.kind === 'preview' && (
+                <PreviewView path={tab.path} active={isActive} onAttachOffice={onAttachOffice} />
               )}
               {tab.kind === 'diff' && <DiffView root={workspaceRoot ?? ''} tab={tab} />}
               {tab.kind === 'terminal' && <TerminalView root={workspaceRoot ?? ''} id={`term-${tab.id}`} active={isActive} />}

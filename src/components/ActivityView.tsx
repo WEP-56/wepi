@@ -3,6 +3,7 @@ import {
   BookOpen,
   ChevronRight,
   CircleAlert,
+  Eye,
   FileText,
   PencilLine,
   Search,
@@ -46,6 +47,8 @@ function ToolIcon({ toolName, className }: { toolName: string; className?: strin
     case 'grep':
     case 'search':
       return <Search className={className} />;
+    case 'show':
+      return <Eye className={className} />;
     case '__compaction__':
       return <Layers className={className} />;
     default:
@@ -71,6 +74,8 @@ function toolVerb(toolName: string): string {
     case 'grep':
     case 'search':
       return '搜索';
+    case 'show':
+      return '预览';
     case '__compaction__':
       return '压缩上下文';
     default:
@@ -82,6 +87,16 @@ function toolVerb(toolName: string): string {
 function argPreview(args: unknown): string | null {
   if (!args || typeof args !== 'object') return null;
   const record = args as Record<string, unknown>;
+  // show 的主参数是数组：取第一项做行内预览，避免显示 [object Object]。
+  if (Array.isArray(record.targets)) {
+    for (const item of record.targets) {
+      if (typeof item === 'string' && item.trim()) return item.trim();
+      if (item && typeof item === 'object') {
+        const value = (item as Record<string, unknown>).path ?? (item as Record<string, unknown>).url;
+        if (typeof value === 'string' && value.trim()) return value.trim();
+      }
+    }
+  }
   for (const key of ['command', 'path', 'filePath', 'file_path', 'query', 'pattern', 'url']) {
     const value = record[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
@@ -285,6 +300,7 @@ export function summarizeActivity(blocks: TurnBlock[]): string {
   let writes = 0;
   let edits = 0;
   let commands = 0;
+  let previews = 0;
   let thought = false;
   for (const block of blocks) {
     if (block.kind === 'thinking') { thought = true; continue; }
@@ -295,12 +311,14 @@ export function summarizeActivity(blocks: TurnBlock[]): string {
       if (path) readPaths.add(path); else readPaths.add(`#${readPaths.size + 1}`);
     } else if (name === 'write') writes += 1;
     else if (name === 'edit') edits += 1;
+    else if (name === 'show') previews += 1;
     else commands += 1;
   }
   if (thought) parts.push('思考');
   if (readPaths.size) parts.push(`读取 ${readPaths.size} 个文件`);
   if (writes) parts.push(`写入 ${writes} 个文件`);
   if (edits) parts.push(`编辑 ${edits} 个文件`);
+  if (previews) parts.push(`准备 ${previews} 项预览`);
   if (commands) parts.push(`运行 ${commands} 条命令`);
   return parts.join(' · ');
 }

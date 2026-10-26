@@ -38,7 +38,11 @@ fn extensions_dir() -> PathBuf {
 
 /// pi 自管 npm 安装目录：`pi install npm:<pkg>` 落在 `~/.pi/agent/npm/node_modules/<pkg>`。
 fn pi_npm_modules_dir() -> PathBuf {
-    home_dir().join(".pi").join("agent").join("npm").join("node_modules")
+    home_dir()
+        .join(".pi")
+        .join("agent")
+        .join("npm")
+        .join("node_modules")
 }
 
 /// 读取 pi settings.json 的 packages 列表（含对象形式的过滤式安装）。
@@ -56,7 +60,10 @@ fn pi_settings_packages() -> Vec<String> {
                 .iter()
                 .filter_map(|item| match item {
                     Value::String(source) => Some(source.clone()),
-                    Value::Object(object) => object.get("source").and_then(Value::as_str).map(str::to_owned),
+                    Value::Object(object) => object
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                     _ => None,
                 })
                 .collect()
@@ -71,10 +78,13 @@ fn pi_executable() -> Option<PathBuf> {
         }
     }
     let home = home_dir();
-    [home.join(".pi/agent/bin/pi.cmd"), home.join(".pi/agent/bin/pi.exe")]
-        .into_iter()
-        .find(|path| path.is_file())
-        .or_else(|| find_on_path("pi"))
+    [
+        home.join(".pi/agent/bin/pi.cmd"),
+        home.join(".pi/agent/bin/pi.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .or_else(|| find_on_path("pi"))
 }
 
 fn find_on_path(command: &str) -> Option<PathBuf> {
@@ -120,7 +130,8 @@ fn run_pi(args: &[&str], online: bool) -> Result<String, String> {
         for arg in args {
             line.push_str(&format!(" {arg}"));
         }
-        let mut command = Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
+        let mut command =
+            Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
         command.raw_arg(line).stdin(Stdio::null());
         for (key, value) in env_extra {
             command.env(key, value);
@@ -142,7 +153,10 @@ fn run_pi(args: &[&str], online: bool) -> Result<String, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(if stderr.is_empty() {
-            format!("pi 命令失败（退出码 {}）", output.status.code().unwrap_or(-1))
+            format!(
+                "pi 命令失败（退出码 {}）",
+                output.status.code().unwrap_or(-1)
+            )
         } else {
             stderr
         });
@@ -221,7 +235,9 @@ fn discover_local_extensions() -> Vec<(String, PathBuf)> {
             continue;
         }
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if file_type.is_file() && (name.ends_with(".ts") || name.ends_with(".js")) {
             found.push((name, path));
             continue;
@@ -253,7 +269,9 @@ fn resolve_entry_points(dir: &Path) -> bool {
             }
         }
     }
-    ["index.ts", "index.js"].iter().any(|index| dir.join(index).is_file())
+    ["index.ts", "index.js"]
+        .iter()
+        .any(|index| dir.join(index).is_file())
 }
 
 /// 扫描 pi 自管 npm 目录里的已安装包（`npm:<name>` → node_modules/<name>）。
@@ -266,14 +284,18 @@ fn discover_npm_dir_packages() -> Vec<(String, PathBuf)> {
         return found;
     };
     for entry in entries.filter_map(Result::ok) {
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if !file_type.is_dir() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         // scoped 包目录（@scope）展开一层，取真实包名。
         if name.starts_with('@') {
-            let Ok(scoped) = fs::read_dir(entry.path()) else { continue };
+            let Ok(scoped) = fs::read_dir(entry.path()) else {
+                continue;
+            };
             for child in scoped.filter_map(Result::ok) {
                 if child.file_type().ok().is_some_and(|t| t.is_dir()) {
                     let scoped_name = format!("{}/{}", name, child.file_name().to_string_lossy());
@@ -309,7 +331,10 @@ pub fn list(force_refresh: bool) -> Result<Value, String> {
                     let package = source.trim_start_matches("npm:").to_owned();
                     if let Some(path) = entry.get("path").and_then(Value::as_str) {
                         if let Ok(current) = read_installed_version(path) {
-                            entry.as_object_mut().unwrap().insert("currentVersion".into(), json!(current));
+                            entry
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("currentVersion".into(), json!(current));
                         }
                     }
                     if let Ok(latest) = npm_view_version(&package) {
@@ -317,7 +342,8 @@ pub fn list(force_refresh: bool) -> Result<Value, String> {
                         object.insert("latestVersion".into(), json!(latest));
                         let current = object.get("currentVersion").and_then(Value::as_str);
                         if let Some(current) = current {
-                            let has_update = crate::pi_runtime::compare_versions(&latest, current) > 0;
+                            let has_update =
+                                crate::pi_runtime::compare_versions(&latest, current) > 0;
                             object.insert("hasUpdate".into(), json!(has_update));
                         }
                     }
@@ -334,14 +360,20 @@ pub fn list(force_refresh: bool) -> Result<Value, String> {
     let declared = pi_settings_packages();
     for (name, path) in discover_npm_dir_packages() {
         let source = format!("npm:{name}");
-        let already = merged.iter().any(|entry| {
-            entry.get("source").and_then(Value::as_str) == Some(source.as_str())
-        }) || installed_paths.iter().any(|installed| installed == &path.to_string_lossy());
+        let already = merged
+            .iter()
+            .any(|entry| entry.get("source").and_then(Value::as_str) == Some(source.as_str()))
+            || installed_paths
+                .iter()
+                .any(|installed| installed == &path.to_string_lossy());
         if already {
             continue;
         }
         // 只收 pi 真正登记的包：npm 目录里可能有历史残留/依赖，未登记的不算扩展。
-        if !declared.iter().any(|item| item == &source || item.trim_start_matches("npm:") == name) {
+        if !declared
+            .iter()
+            .any(|item| item == &source || item.trim_start_matches("npm:") == name)
+        {
             continue;
         }
         merged.push(json!({
@@ -352,7 +384,9 @@ pub fn list(force_refresh: bool) -> Result<Value, String> {
         }));
     }
     for (name, path) in discover_local_extensions() {
-        if !installed_paths.iter().any(|installed| Path::new(installed).ends_with(&name) || installed == &path.to_string_lossy()) {
+        if !installed_paths.iter().any(|installed| {
+            Path::new(installed).ends_with(&name) || installed == &path.to_string_lossy()
+        }) {
             merged.push(json!({
                 "id": format!("local:{name}"),
                 "source": name,
@@ -364,11 +398,15 @@ pub fn list(force_refresh: bool) -> Result<Value, String> {
     }
     let disabled: Vec<String> = wepi_settings::disabled_extensions();
     for entry in merged.iter_mut() {
-        let source = entry.get("source").and_then(Value::as_str).unwrap_or_default().to_owned();
-        entry
-            .as_object_mut()
-            .expect("构造时即为对象")
-            .insert("enabled".into(), json!(!disabled.iter().any(|item| item == &source)));
+        let source = entry
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        entry.as_object_mut().expect("构造时即为对象").insert(
+            "enabled".into(),
+            json!(!disabled.iter().any(|item| item == &source)),
+        );
     }
     merged.sort_by(|a, b| {
         a.get("source")
@@ -423,7 +461,8 @@ pub fn uninstall(source: &str) -> Result<(), String> {
         .iter()
         .any(|prefix| normalized.to_lowercase().starts_with(prefix));
     if is_local {
-        let root = fs::canonicalize(extensions_dir()).map_err(|e| format!("定位扩展目录失败：{e}"))?;
+        let root =
+            fs::canonicalize(extensions_dir()).map_err(|e| format!("定位扩展目录失败：{e}"))?;
         let target = root.join(normalized);
         let canonical = fs::canonicalize(&target).map_err(|e| format!("定位扩展失败：{e}"))?;
         if !canonical.starts_with(&root) || canonical.parent() != Some(root.as_path()) {
@@ -454,7 +493,9 @@ pub fn update_one(source: &str) -> Result<Value, String> {
         return Err("扩展名不能为空".to_owned());
     }
     let output = run_pi(&["update", normalized], true)?;
-    Ok(json!({ "success": true, "command": format!("pi update {normalized}"), "output": output.trim() }))
+    Ok(
+        json!({ "success": true, "command": format!("pi update {normalized}"), "output": output.trim() }),
+    )
 }
 
 /// 更新全部扩展：`pi update --extensions`。
@@ -499,7 +540,9 @@ fn urlencode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -533,13 +576,19 @@ fn decode_one_entity(entity: &str) -> String {
         "&nbsp;" => " ".into(),
         "&amp;" => "&".into(),
         other => {
-            if let Some(hex) = other.strip_prefix("&#x").and_then(|value| value.strip_suffix(';')) {
+            if let Some(hex) = other
+                .strip_prefix("&#x")
+                .and_then(|value| value.strip_suffix(';'))
+            {
                 if let Ok(code) = u32::from_str_radix(hex, 16) {
                     if let Some(ch) = char::from_u32(code) {
                         return ch.to_string();
                     }
                 }
-            } else if let Some(dec) = other.strip_prefix("&#").and_then(|value| value.strip_suffix(';')) {
+            } else if let Some(dec) = other
+                .strip_prefix("&#")
+                .and_then(|value| value.strip_suffix(';'))
+            {
                 if let Ok(code) = dec.parse::<u32>() {
                     if let Some(ch) = char::from_u32(code) {
                         return ch.to_string();
@@ -596,7 +645,9 @@ fn parse_catalog_html(html: &str) -> (Vec<Value>, u32, u32, u32) {
             .copied()
             .unwrap_or(html.len());
         let body = &html[tag_end..body_end];
-        let Some(name) = attribute_of(tag, "data-package-name") else { continue };
+        let Some(name) = attribute_of(tag, "data-package-name") else {
+            continue;
+        };
         let description = body
             .find("<p class=\"packages-desc\">")
             .and_then(|start| {
@@ -613,8 +664,8 @@ fn parse_catalog_html(html: &str) -> (Vec<Value>, u32, u32, u32) {
                 Some(decode_entities(&strip_tags(&rest[..end])).trim().to_owned())
             })
             .unwrap_or_default();
-        let downloads = attribute_of(tag, "data-package-downloads")
-            .and_then(|value| value.parse::<u64>().ok());
+        let downloads =
+            attribute_of(tag, "data-package-downloads").and_then(|value| value.parse::<u64>().ok());
         let published_at = attribute_of(tag, "data-package-date")
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0);
@@ -626,15 +677,16 @@ fn parse_catalog_html(html: &str) -> (Vec<Value>, u32, u32, u32) {
             .and_then(|start| {
                 let rest = &body[start + 6..];
                 let end = rest.find('"')?;
-                Some(format!("https://www.npmjs.com/package/{}", &rest[..end].trim_start_matches("https://www.npmjs.com/package/")))
+                Some(format!(
+                    "https://www.npmjs.com/package/{}",
+                    &rest[..end].trim_start_matches("https://www.npmjs.com/package/")
+                ))
             });
-        let github_url = body
-            .find("href=\"https://github.com/")
-            .and_then(|start| {
-                let rest = &body[start + 6..];
-                let end = rest.find('"')?;
-                Some(rest[..end].to_owned())
-            });
+        let github_url = body.find("href=\"https://github.com/").and_then(|start| {
+            let rest = &body[start + 6..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_owned())
+        });
         let page_url = format!("{CATALOG_URL}/{name}");
         let mut entry = Map::new();
         entry.insert("name".into(), json!(name));
@@ -692,11 +744,22 @@ fn parse_catalog_html(html: &str) -> (Vec<Value>, u32, u32, u32) {
             last_page = last_page.max(total.div_ceil(page_size));
         }
     }
-    (items, range_start, range_end, total.max(last_page.min(u32::MAX)))
+    (
+        items,
+        range_start,
+        range_end,
+        total.max(last_page.min(u32::MAX)),
+    )
 }
 
 /// 抓取商店目录（带 10 分钟内存缓存）。
-pub fn catalog(page: u32, query: &str, kind: &str, sort: &str, refresh: bool) -> Result<Value, String> {
+pub fn catalog(
+    page: u32,
+    query: &str,
+    kind: &str,
+    sort: &str,
+    refresh: bool,
+) -> Result<Value, String> {
     let key = format!("{page}\t{}\t{kind}\t{sort}", query.trim());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -727,9 +790,21 @@ pub fn catalog(page: u32, query: &str, kind: &str, sort: &str, refresh: bool) ->
     if items.is_empty() && is_first_bare_page {
         return Err("pi.dev 目录页解析到 0 个包".to_owned());
     }
-    let page_size = if items.is_empty() { 50 } else { items.len() as u32 };
-    let total = if total_or_last > 0 { total_or_last.max(page) } else { page };
-    let last_page = if total > 0 && page_size > 0 { total.div_ceil(page_size).max(page) } else { page };
+    let page_size = if items.is_empty() {
+        50
+    } else {
+        items.len() as u32
+    };
+    let total = if total_or_last > 0 {
+        total_or_last.max(page)
+    } else {
+        page
+    };
+    let last_page = if total > 0 && page_size > 0 {
+        total.div_ceil(page_size).max(page)
+    } else {
+        page
+    };
     let value = json!({
         "items": items,
         "page": page,
@@ -800,7 +875,10 @@ mod tests {
             if name.starts_with('@') {
                 for child in fs::read_dir(entry.path()).unwrap().filter_map(Result::ok) {
                     if child.file_type().unwrap().is_dir() {
-                        found.push((format!("{}/{}", name, child.file_name().to_string_lossy()), child.path()));
+                        found.push((
+                            format!("{}/{}", name, child.file_name().to_string_lossy()),
+                            child.path(),
+                        ));
                     }
                 }
             } else {
@@ -809,8 +887,14 @@ mod tests {
         }
         found.sort_by(|a, b| a.0.cmp(&b.0));
         let names: Vec<&str> = found.iter().map(|(name, _)| name.as_str()).collect();
-        assert!(names.contains(&"@earendil/pi-something"), "scoped package not expanded: {names:?}");
-        assert!(names.contains(&"pi-web-access"), "normal package missing: {names:?}");
+        assert!(
+            names.contains(&"@earendil/pi-something"),
+            "scoped package not expanded: {names:?}"
+        );
+        assert!(
+            names.contains(&"pi-web-access"),
+            "normal package missing: {names:?}"
+        );
         // 顺序：@ 开头的包排在字母前，但两者都必须存在。
         assert_eq!(found.len(), 2);
         let _ = fs::remove_dir_all(&root);
@@ -844,7 +928,10 @@ mod tests {
             // pi 不存在的机器上跳过（CI/干净环境），不算失败。
             return;
         };
-        let extensions = result.get("extensions").and_then(Value::as_array).expect("extensions array");
+        let extensions = result
+            .get("extensions")
+            .and_then(Value::as_array)
+            .expect("extensions array");
         let mut sources: Vec<&str> = extensions
             .iter()
             .filter_map(|entry| entry.get("source").and_then(Value::as_str))
@@ -855,7 +942,10 @@ mod tests {
             .filter(|pair| pair[0] == pair[1])
             .map(|pair| pair[0].to_owned())
             .collect();
-        assert!(duplicates.is_empty(), "duplicate extension sources: {duplicates:?}");
+        assert!(
+            duplicates.is_empty(),
+            "duplicate extension sources: {duplicates:?}"
+        );
         for entry in extensions {
             let enabled = entry.get("enabled").and_then(Value::as_bool);
             assert!(enabled.is_some(), "missing enabled: {entry}");

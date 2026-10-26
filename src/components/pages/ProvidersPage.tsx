@@ -160,9 +160,24 @@ export default function ProvidersPage({
   const [test, setTest] = useState<Record<string, { s: 'testing' | 'ok' | 'error'; msg: string }>>({});
   const [openModel, setOpenModel] = useState<string | null>(null);
   const [modelFetch, setModelFetch] = useState<Record<string, { s: 'loading' | 'ok' | 'error'; msg: string }>>({});
+  const [pendingDelete, setPendingDelete] = useState<Provider | null>(null);
 
   const p = providers.find((x) => x.id === sel) ?? providers[0];
   const patch = (id: string, pt: Partial<Provider>) => setProviders((ps) => ps.map((x) => (x.id === id ? { ...x, ...pt } : x)));
+
+  const removeProvider = (target: Provider) => {
+    const remaining = providers.filter((x) => x.id !== target.id);
+    setProviders(remaining);
+    // 删的是非当前项时不要跳走；只有当前项被删才切到第一个剩余提供商。
+    setSel((current) => (remaining.some((x) => x.id === current) ? current : remaining[0]?.id ?? ''));
+    // 默认模型指向被删提供商时，切到第一个还存在的模型；没有就清空，
+    // 让 Pi 回到自己的默认模型，避免输入框里留一个已失效的 provider:model。
+    if (defaultModel.startsWith(`${target.id}:`)) {
+      onSetDefault(remaining.flatMap((x) => x.models.map((m) => `${x.id}:${m}`))[0] ?? '');
+    }
+    setPendingDelete(null);
+    onToast(`已删除提供商 ${target.name}`);
+  };
 
   const fetchModels = async () => {
     if (!p || !p.baseUrl.trim()) return;
@@ -231,24 +246,36 @@ export default function ProvidersPage({
         <div className="px-4 pb-3 pt-4 text-[17px] font-semibold text-[var(--text)]">提供商配置</div>
         <div className="scroll-thin flex-1 overflow-y-auto px-2 pb-2">
           {providers.map((x) => (
-            <button
+            <div
               key={x.id}
-              onClick={() => {
-                setSel(x.id);
-                setShowKey(false);
-              }}
               className={cn(
-                'mb-0.5 flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left hover:bg-[var(--bg-hover)]',
+                'group mb-0.5 flex items-center gap-0.5 rounded-lg',
                 p?.id === x.id && 'bg-[var(--bg-active)]',
               )}
             >
-              <Avatar p={x} />
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-[13.5px] font-medium text-[var(--text)]">{x.name}</div>
-                <div className="text-[12px] text-[var(--text-3)]">{x.models.length} 个模型</div>
-              </div>
-              <span className={cn('h-2 w-2 shrink-0 rounded-full', x.enabled ? 'bg-[#3fb950]' : 'bg-[var(--text-3)]/50')} />
-            </button>
+              <button
+                onClick={() => {
+                  setSel(x.id);
+                  setShowKey(false);
+                }}
+                className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-2 py-2 text-left hover:bg-[var(--bg-hover)]"
+              >
+                <Avatar p={x} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13.5px] font-medium text-[var(--text)]">{x.name}</div>
+                  <div className="text-[12px] text-[var(--text-3)]">{x.models.length} 个模型</div>
+                </div>
+                <span className={cn('h-2 w-2 shrink-0 rounded-full', x.enabled ? 'bg-[#3fb950]' : 'bg-[var(--text-3)]/50')} />
+              </button>
+              <button
+                title={`删除提供商 ${x.name}`}
+                aria-label={`删除提供商 ${x.name}`}
+                onClick={() => setPendingDelete(x)}
+                className="mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-3)] opacity-60 transition-opacity hover:bg-[var(--bg-hover)] hover:text-[#f85149] focus-visible:opacity-100 group-hover:opacity-100"
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
           ))}
         </div>
         <div className="border-t border-[var(--border)] p-2">
@@ -268,6 +295,14 @@ export default function ProvidersPage({
                 <div className="text-[13px] text-[var(--text-3)]">{kindMeta[p.kind].label} · {p.enabled ? '已启用，模型会出现在输入框的模型列表中' : '未启用'}</div>
               </div>
               <Toggle on={p.enabled} onChange={(v) => patch(p.id, { enabled: v })} />
+              <button
+                title="删除提供商"
+                aria-label={`删除提供商 ${p.name}`}
+                onClick={() => setPendingDelete(p)}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--text-3)] hover:bg-[var(--bg-hover)] hover:text-[#f85149]"
+              >
+                <Trash2 size={15} />
+              </button>
             </div>
 
             <h3 className="mb-3 text-[14px] font-medium text-[var(--text)]">连接</h3>
@@ -410,18 +445,9 @@ export default function ProvidersPage({
               </form>
             </Card>
 
-            {p.custom && (
-              <Btn
-                variant="danger"
-                onClick={() => {
-                  setProviders((ps) => ps.filter((x) => x.id !== p.id));
-                  setSel(providers.find((x) => x.id !== p.id)?.id ?? '');
-                  onToast(`已删除提供商 ${p.name}`);
-                }}
-              >
-                <Trash2 size={13} /> 删除此提供商
-              </Btn>
-            )}
+            <Btn variant="danger" onClick={() => setPendingDelete(p)}>
+              <Trash2 size={13} /> 删除此提供商
+            </Btn>
           </div>
         ) : (
           <div className="flex h-full items-center justify-center text-[13.5px] text-[var(--text-3)]">暂无提供商，点击左下角添加。</div>
@@ -438,6 +464,24 @@ export default function ProvidersPage({
             onToast(`已添加提供商 ${np.name}`);
           }}
         />
+      )}
+
+      {pendingDelete && (
+        <Modal title="删除提供商" onClose={() => setPendingDelete(null)} width={460}>
+          <p className="text-[13px] leading-6 text-[var(--text-2)]">
+            确定删除「<span className="font-medium text-[var(--text)]">{pendingDelete.name}</span>」吗？
+            这会从 Pi 的 <code className="font-mono text-[12px]">models.json</code> 移除该提供商及其{' '}
+            {pendingDelete.models.length} 个模型，无法撤销。
+          </p>
+          <div className="mt-6 flex justify-end gap-2">
+            <Btn variant="ghost" onClick={() => setPendingDelete(null)}>
+              取消
+            </Btn>
+            <Btn variant="danger" onClick={() => removeProvider(pendingDelete)}>
+              <Trash2 size={13} /> 删除
+            </Btn>
+          </div>
+        </Modal>
       )}
     </div>
   );

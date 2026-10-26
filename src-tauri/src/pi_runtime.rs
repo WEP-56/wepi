@@ -64,7 +64,10 @@ fn candidate_installations() -> Vec<(String, Vec<PathBuf>)> {
     }
     if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
         let base = PathBuf::from(localappdata);
-        for candidate in [("pnpm".to_owned(), "pi.cmd"), ("Yarn".to_owned(), "bin\\pi.cmd")] {
+        for candidate in [
+            ("pnpm".to_owned(), "pi.cmd"),
+            ("Yarn".to_owned(), "bin\\pi.cmd"),
+        ] {
             let path = base.join(&candidate.0).join(candidate.1);
             if path.is_file() {
                 npm_dirs.push(path);
@@ -124,8 +127,13 @@ fn probe_version(executable: &str) -> Result<String, String> {
     let path = PathBuf::from(trimmed);
     let output = if cfg!(windows) && !trimmed.to_ascii_lowercase().ends_with(".exe") {
         // .cmd 垫片必须经 cmd.exe；raw_arg 避免二次转义。
-        let mut command = Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
-        command.raw_arg(format!("/D /S /C \"{}\" --version", trimmed.replace('"', "")))
+        let mut command =
+            Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
+        command
+            .raw_arg(format!(
+                "/D /S /C \"{}\" --version",
+                trimmed.replace('"', "")
+            ))
             .stdin(Stdio::null());
         #[cfg(windows)]
         crate::no_window(&mut command);
@@ -145,11 +153,18 @@ fn probe_version(executable: &str) -> Result<String, String> {
     let version = text
         .lines()
         .rev()
-        .find_map(|line| line.trim().strip_prefix('v').map(str::to_owned).or_else(|| {
-            // 直接匹配 x.y.z 形态。
-            let found = line.split_whitespace().find(|token| looks_like_version(token))?;
-            Some(found.to_owned())
-        }))
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix('v')
+                .map(str::to_owned)
+                .or_else(|| {
+                    // 直接匹配 x.y.z 形态。
+                    let found = line
+                        .split_whitespace()
+                        .find(|token| looks_like_version(token))?;
+                    Some(found.to_owned())
+                })
+        })
         .unwrap_or(text);
     Ok(version)
 }
@@ -221,8 +236,17 @@ pub fn scan_installations() -> Result<Value, String> {
     }
     for path in wepi_settings::custom_pi_paths() {
         let exists = Path::new(&path).is_file();
-        let version = if exists { probe_version(&path).ok() } else { None };
-        installations.push(installation_entry("我添加的路径", Path::new(&path), version, !exists));
+        let version = if exists {
+            probe_version(&path).ok()
+        } else {
+            None
+        };
+        installations.push(installation_entry(
+            "我添加的路径",
+            Path::new(&path),
+            version,
+            !exists,
+        ));
     }
     // 找出最高版本供前端标记「较旧」。
     let mut newest: Option<String> = None;
@@ -241,12 +265,15 @@ pub fn scan_installations() -> Result<Value, String> {
         }
     }
     for entry in installations.iter_mut() {
-        let version = entry.get("version").and_then(Value::as_str).map(str::to_owned);
+        let version = entry
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if let (Some(version), Some(best)) = (version, newest.as_deref()) {
-            entry
-                .as_object_mut()
-                .expect("构造时即为对象")
-                .insert("isNewest".into(), Value::Bool(compare_versions(&version, best) >= 0));
+            entry.as_object_mut().expect("构造时即为对象").insert(
+                "isNewest".into(),
+                Value::Bool(compare_versions(&version, best) >= 0),
+            );
         }
     }
     Ok(json!({ "installations": installations }))
@@ -277,7 +304,11 @@ pub fn check_update() -> Result<Value, String> {
             items
                 .iter()
                 .filter(|item| item.get("version").is_some_and(Value::is_string))
-                .find_map(|item| item.get("version").and_then(Value::as_str).map(str::to_owned))
+                .find_map(|item| {
+                    item.get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
         });
     let latest = match fetch_latest_version() {
         Ok(latest) => latest,
@@ -325,9 +356,9 @@ pub fn update_pi() -> Result<Value, String> {
         for arg in &args {
             line.push_str(&format!(" {arg}"));
         }
-        let mut command = Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
-        command.raw_arg(line)
-            .stdin(Stdio::null());
+        let mut command =
+            Command::new(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()));
+        command.raw_arg(line).stdin(Stdio::null());
         #[cfg(windows)]
         crate::no_window(&mut command);
         command.output()
@@ -353,17 +384,39 @@ pub fn update_pi() -> Result<Value, String> {
 /// 环境诊断：关键工具可用性 + Pi 配置目录状态。
 pub fn run_diagnostics() -> Result<Value, String> {
     let checks = vec![
-        ("Pi CLI", find_on_path("pi").or_else(|| {
-            let home = home_dir();
-            [".pi/agent/bin/pi.cmd", ".pi/agent/bin/pi.exe"]
-                .iter()
-                .map(|relative| home.join(relative))
-                .find(|path| path.is_file())
-        }).is_some(), "运行 Agent 会话的必要组件"),
-        ("Node.js", find_on_path("node").is_some() || find_node_install().is_some(), "Pi（npm 安装形态）的运行时"),
-        ("npx", find_on_path("npx").is_some(), "技能商店一键安装使用 npx"),
-        ("git", find_on_path("git").is_some(), "项目 Git 面板与 diff 功能"),
-        ("curl", find_on_path("curl").is_some(), "MCP HTTP 连通性探测"),
+        (
+            "Pi CLI",
+            find_on_path("pi")
+                .or_else(|| {
+                    let home = home_dir();
+                    [".pi/agent/bin/pi.cmd", ".pi/agent/bin/pi.exe"]
+                        .iter()
+                        .map(|relative| home.join(relative))
+                        .find(|path| path.is_file())
+                })
+                .is_some(),
+            "运行 Agent 会话的必要组件",
+        ),
+        (
+            "Node.js",
+            find_on_path("node").is_some() || find_node_install().is_some(),
+            "Pi（npm 安装形态）的运行时",
+        ),
+        (
+            "npx",
+            find_on_path("npx").is_some(),
+            "技能商店一键安装使用 npx",
+        ),
+        (
+            "git",
+            find_on_path("git").is_some(),
+            "项目 Git 面板与 diff 功能",
+        ),
+        (
+            "curl",
+            find_on_path("curl").is_some(),
+            "MCP HTTP 连通性探测",
+        ),
     ];
     let pi_dir = home_dir().join(".pi").join("agent");
     let checks_json: Vec<Value> = checks
@@ -388,7 +441,10 @@ fn find_node_install() -> Option<PathBuf> {
         }
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let path = PathBuf::from(local).join("Programs").join("nodejs").join("node.exe");
+        let path = PathBuf::from(local)
+            .join("Programs")
+            .join("nodejs")
+            .join("node.exe");
         if path.is_file() {
             return Some(path);
         }

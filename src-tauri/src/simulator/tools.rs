@@ -24,11 +24,17 @@ fn failed(error: impl Into<String>) -> Value {
 }
 
 fn string(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn number(args: &Value, key: &str) -> Result<f64, String> {
-    args.get(key).and_then(Value::as_f64).ok_or_else(|| format!("缺少参数：{key}"))
+    args.get(key)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("缺少参数：{key}"))
 }
 
 fn integer(args: &Value, key: &str) -> Option<u64> {
@@ -118,7 +124,11 @@ pub fn catalog() -> Vec<Value> {
 }
 
 /// 找到要操作的设备：显式 udid > 面板选中的 > 唯一在运行的那台。
-fn resolve(sims: &Simulators, udid: Option<&str>, booted: bool) -> Result<(super::Device, String), String> {
+fn resolve(
+    sims: &Simulators,
+    udid: Option<&str>,
+    booted: bool,
+) -> Result<(super::Device, String), String> {
     let devices = super::devices();
     let device = match udid {
         Some(udid) => devices
@@ -136,19 +146,33 @@ fn resolve(sims: &Simulators, udid: Option<&str>, booted: bool) -> Result<(super
             chosen
         }
     };
-    let name = super::avd(&device.udid).ok_or("无效的模拟器 id")?.to_owned();
+    let name = super::avd(&device.udid)
+        .ok_or("无效的模拟器 id")?
+        .to_owned();
     if booted && device.state != "Running" {
-        return Err(format!("{} 没有在运行：先用 wepi_simulator_manage 的 boot 启动它", device.name));
+        return Err(format!(
+            "{} 没有在运行：先用 wepi_simulator_manage 的 boot 启动它",
+            device.name
+        ));
     }
     Ok((device, name))
 }
 
-fn look(device: &super::Device, name: &str, sims: &Simulators, note: &str) -> Result<Value, String> {
+fn look(
+    device: &super::Device,
+    name: &str,
+    sims: &Simulators,
+    note: &str,
+) -> Result<Value, String> {
     // 休眠中的屏幕截出来是纯黑，先叫醒再拍，并在文本里说明。
     let woke = super::wake(name).unwrap_or(false);
     let screen = sims.shown(name)?;
     let jpeg = super::screenshot(name, screen)?;
-    let woke = if woke { "（屏幕原本在休眠，已唤醒）" } else { "" };
+    let woke = if woke {
+        "（屏幕原本在休眠，已唤醒）"
+    } else {
+        ""
+    };
     Ok(done(vec![
         image_content(jpeg, "image/jpeg"),
         text_content(format!(
@@ -169,7 +193,8 @@ pub fn dispatch(sims: &Simulators, name: &str, args: &Value) -> Result<Value, St
             let selected = sims.selected();
             Ok(done(vec![text_content(format!(
                 "模拟器（selected 是 WEPI 面板正在显示的那台）：\n{}",
-                serde_json::to_string_pretty(&json!({ "devices": devices, "selected": selected })).unwrap_or_default()
+                serde_json::to_string_pretty(&json!({ "devices": devices, "selected": selected }))
+                    .unwrap_or_default()
             ))]))
         }
         "wepi_simulator_screenshot" => {
@@ -181,16 +206,30 @@ pub fn dispatch(sims: &Simulators, name: &str, args: &Value) -> Result<Value, St
             let woke = super::wake(&name).unwrap_or(false);
             let screen = sims.shown(&name)?;
             let summary = super::describe(&name, screen.scale)?;
-            let woke = if woke { "（屏幕原本在休眠，已唤醒）" } else { "" };
-            Ok(done(vec![text_content(format!("{woke}{}（{}）\n{summary}", device.name, device.udid))]))
+            let woke = if woke {
+                "（屏幕原本在休眠，已唤醒）"
+            } else {
+                ""
+            };
+            Ok(done(vec![text_content(format!(
+                "{woke}{}（{}）\n{summary}",
+                device.name, device.udid
+            ))]))
         }
         "wepi_simulator_control" => {
             let (device, name) = resolve(sims, udid.as_deref(), true)?;
             let screen = sims.shown(&name)?;
             let action = string(args, "action").ok_or("缺少参数：action")?;
             let input = match action.as_str() {
-                "tap" | "double_tap" => Input::Tap { x: number(args, "x")?, y: number(args, "y")? },
-                "long_press" => Input::LongPress { x: number(args, "x")?, y: number(args, "y")?, duration_ms: integer(args, "durationMs") },
+                "tap" | "double_tap" => Input::Tap {
+                    x: number(args, "x")?,
+                    y: number(args, "y")?,
+                },
+                "long_press" => Input::LongPress {
+                    x: number(args, "x")?,
+                    y: number(args, "y")?,
+                    duration_ms: integer(args, "durationMs"),
+                },
                 "swipe" => Input::Swipe {
                     x: number(args, "x")?,
                     y: number(args, "y")?,
@@ -198,10 +237,22 @@ pub fn dispatch(sims: &Simulators, name: &str, args: &Value) -> Result<Value, St
                     end_y: number(args, "endY")?,
                     duration_ms: integer(args, "durationMs"),
                 },
-                "type" => Input::Type { text: args.get("text").and_then(Value::as_str).unwrap_or_default().to_owned() },
-                "key" => Input::Key { key: string(args, "key").ok_or("缺少参数：key")? },
-                "button" => Input::Button { button: string(args, "button").ok_or("缺少参数：button")? },
-                "tap_label" => Input::TapLabel { label: string(args, "label").ok_or("缺少参数：label")? },
+                "type" => Input::Type {
+                    text: args
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                },
+                "key" => Input::Key {
+                    key: string(args, "key").ok_or("缺少参数：key")?,
+                },
+                "button" => Input::Button {
+                    button: string(args, "button").ok_or("缺少参数：button")?,
+                },
+                "tap_label" => Input::TapLabel {
+                    label: string(args, "label").ok_or("缺少参数：label")?,
+                },
                 _ => return Ok(failed("未知的 action")),
             };
             let mut report = super::input(&name, screen, &input)?;
@@ -241,10 +292,17 @@ pub fn dispatch(sims: &Simulators, name: &str, args: &Value) -> Result<Value, St
                     let path = string(args, "path").ok_or("缺少参数：path")?;
                     super::install(&name, std::path::Path::new(&path))?
                 }
-                "launch" => super::launch(&name, &string(args, "package").ok_or("缺少参数：package")?)?,
-                "terminate" => super::terminate(&name, &string(args, "package").ok_or("缺少参数：package")?)?,
+                "launch" => {
+                    super::launch(&name, &string(args, "package").ok_or("缺少参数：package")?)?
+                }
+                "terminate" => {
+                    super::terminate(&name, &string(args, "package").ok_or("缺少参数：package")?)?
+                }
                 "open_url" => super::open_url(&name, &string(args, "url").ok_or("缺少参数：url")?)?,
-                "appearance" => super::appearance(&name, &string(args, "appearance").ok_or("缺少参数：appearance")?)?,
+                "appearance" => super::appearance(
+                    &name,
+                    &string(args, "appearance").ok_or("缺少参数：appearance")?,
+                )?,
                 _ => return Ok(failed("未知的 action")),
             };
             Ok(done(vec![text_content(report)]))
@@ -291,23 +349,43 @@ mod tests {
         let shot = dispatch(&sims, "wepi_simulator_screenshot", &json!({})).unwrap();
         assert_eq!(shot["content"][0]["type"], "image");
         assert_eq!(shot["content"][0]["mimeType"], "image/jpeg");
-        let bytes = STANDARD.decode(shot["content"][0]["data"].as_str().unwrap()).unwrap();
+        let bytes = STANDARD
+            .decode(shot["content"][0]["data"].as_str().unwrap())
+            .unwrap();
         let image = image::load_from_memory(&bytes).unwrap();
         // 图片像素 == point：1080×2400 @420dpi → 411×914
         assert_eq!((image.width(), image.height()), (411, 914));
 
         let described = dispatch(&sims, "wepi_simulator_describe", &json!({})).unwrap();
-        assert!(described["content"][0]["text"].as_str().unwrap().contains("Screen elements"));
+        assert!(described["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Screen elements"));
 
         // 点一下屏幕中央：动作后应该跟着一张新截图。
-        let tapped = dispatch(&sims, "wepi_simulator_control", &json!({ "action": "tap", "x": 205, "y": 700 })).unwrap();
+        let tapped = dispatch(
+            &sims,
+            "wepi_simulator_control",
+            &json!({ "action": "tap", "x": 205, "y": 700 }),
+        )
+        .unwrap();
         assert_eq!(tapped["isError"], Value::Null);
         assert_eq!(tapped["content"][0]["type"], "image");
-        assert!(tapped["content"][1]["text"].as_str().unwrap().contains("Tapped"));
+        assert!(tapped["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Tapped"));
 
         // 屏幕睡着时截图是纯黑：工具要先唤醒，并在文本里说明。
         let screen = sims.shown("Medium_Phone").unwrap();
-        super::super::input("Medium_Phone", screen, &Input::Button { button: "lock".into() }).unwrap();
+        super::super::input(
+            "Medium_Phone",
+            screen,
+            &Input::Button {
+                button: "lock".into(),
+            },
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let woken = dispatch(&sims, "wepi_simulator_screenshot", &json!({})).unwrap();
         let text = woken["content"][1]["text"].as_str().unwrap();

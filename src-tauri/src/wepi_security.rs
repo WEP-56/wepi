@@ -156,18 +156,43 @@ pub fn default_config() -> Value {
 /// 读取安全配置（settings.json 的 securityConfig；缺失/损坏时回退默认）。
 pub fn load_config() -> Value {
     let settings = crate::wepi_settings::read();
-    let config = settings.get("securityConfig").cloned().unwrap_or(Value::Null);
-    if config.is_object() && config.get("levels").and_then(Value::as_array).is_some_and(|l| !l.is_empty()) {
+    let config = settings
+        .get("securityConfig")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if config.is_object()
+        && config
+            .get("levels")
+            .and_then(Value::as_array)
+            .is_some_and(|l| !l.is_empty())
+    {
         // 补齐可能缺失的字段（旧版本升级兜底）。
         let mut merged = config;
         if merged.get("enabled").and_then(Value::as_bool).is_none() {
-            merged.as_object_mut().unwrap().insert("enabled".into(), json!(true));
+            merged
+                .as_object_mut()
+                .unwrap()
+                .insert("enabled".into(), json!(true));
         }
-        if merged.get("defaultLevelId").and_then(Value::as_str).is_none() {
-            merged.as_object_mut().unwrap().insert("defaultLevelId".into(), json!("standard"));
+        if merged
+            .get("defaultLevelId")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            merged
+                .as_object_mut()
+                .unwrap()
+                .insert("defaultLevelId".into(), json!("standard"));
         }
-        if merged.get("sessionOverrides").and_then(Value::as_object).is_none() {
-            merged.as_object_mut().unwrap().insert("sessionOverrides".into(), json!({}));
+        if merged
+            .get("sessionOverrides")
+            .and_then(Value::as_object)
+            .is_none()
+        {
+            merged
+                .as_object_mut()
+                .unwrap()
+                .insert("sessionOverrides".into(), json!({}));
         }
         merged
     } else {
